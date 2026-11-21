@@ -12,7 +12,7 @@ export type Slippage =
 export interface SwapRequest {
   tokenIn: TokenId;
   tokenOut: TokenId;
-  amount: { exactIn: bigint } | { exactOut: bigint };
+  amount: { exactIn: bigint; exactOut?: never } | { exactOut: bigint; exactIn?: never };
   /** `0.01` is 1% */
   slippage: Slippage;
   /** Needed to swap, not to quote */

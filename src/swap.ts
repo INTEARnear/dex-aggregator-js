@@ -1,4 +1,10 @@
-import { OUTCOME_TIMEOUT_MS, RETRY_DELAY_MS, retryDelay, type RouterConnection } from "./connection.js";
+import {
+  OUTCOME_TIMEOUT_MS,
+  RETRY_DELAY_MS,
+  requestIsWrong,
+  retryDelay,
+  type RouterConnection,
+} from "./connection.ts";
 import type {
   Action,
   ExecutionInstruction,
@@ -6,8 +12,8 @@ import type {
   SwapOutcome,
   Transaction,
   TraderSwapRequest,
-} from "./types.js";
-import { validateNextSteps, validateQuote } from "./validate.js";
+} from "./types.ts";
+import { validateNextSteps, validateQuote } from "./validate.ts";
 
 export const ROUTER_URL = "https://router.intear.tech";
 
@@ -29,9 +35,22 @@ export interface SwapProgress {
    * The quote's transactions executed, and the router is finding out what they did, asking it
    * again after its errors until it tells or gives up
    */
-  onSwapSent?: (txHashes: string[]) => void;
+  onSwapSent?: (txHashes: readonly string[]) => void;
   /** The next steps of the outcome are about to be signed */
   onOutcome?: (outcome: SwapOutcome) => void;
+}
+
+/** A signer failed on a transaction of the swap, after the ones before it executed */
+export class SwapInterruptedError extends Error {
+  /** Of the transactions that executed before it */
+  readonly txHashes: readonly string[];
+
+  constructor(txHashes: readonly string[], cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    super(`The swap stopped after ${txHashes.length} of its transactions: ${reason}`, { cause });
+    this.name = "SwapInterruptedError";
+    this.txHashes = txHashes;
+  }
 }
 
 export interface SwapResult {
@@ -49,6 +68,8 @@ export async function swapWithNearConnect({
   request,
   quote,
   routerUrl = ROUTER_URL,
+  retryDelayMs = RETRY_DELAY_MS,
+  outcomeTimeoutMs = OUTCOME_TIMEOUT_MS,
   onSwapSent,
   onOutcome,
 }: {
@@ -56,6 +77,10 @@ export async function swapWithNearConnect({
   request: TraderSwapRequest;
   quote: Quote;
   routerUrl?: string;
+  /** Waits twice as long after each request for the outcome that fails, from `min` up to `max` */
+  retryDelayMs?: { min: number; max: number };
+  /** Gives up on the outcome after this long, asking again until then when the router errs */
+  outcomeTimeoutMs?: number;
 } & SwapProgress): Promise<SwapResult> {
   if (quote.quote_id !== undefined) {
     throw new Error("A quote with its fees in the next steps is for swapWithSigner");
@@ -68,7 +93,7 @@ export async function swapWithNearConnect({
   });
   const txHashes = results.map((result) => result.transaction_outcome.id);
   onSwapSent?.(txHashes);
-  const outcome = await fetchOutcome(routerUrl, request, quote, txHashes);
+  const outcome = await fetchOutcome(routerUrl, request, quote, txHashes, retryDelayMs, outcomeTimeoutMs);
   validateNextSteps(request, quote, outcome);
   onOutcome?.(outcome);
   const afterSwap = [
@@ -108,9 +133,13 @@ export async function swapWithSigner({
     throw new Error("swapWithSigner takes a quote of a subscription with feesInNextSteps");
   }
   validateQuote(request, quote);
-  const txHashes = [];
+  const txHashes: string[] = [];
   for (const transaction of toTransactions(quote.execution_instructions)) {
-    txHashes.push(await signer.signAndSendTransaction(transaction));
+    try {
+      txHashes.push(await signer.signAndSendTransaction(transaction));
+    } catch (error) {
+      throw new SwapInterruptedError(txHashes, error);
+    }
   }
   onSwapSent?.(txHashes);
   const outcome = await connection.outcome(quote.quote_id, txHashes);
@@ -141,6 +170,7 @@ export function toTransactions(instructions: ExecutionInstruction[]): Transactio
         type: "FunctionCall",
         params: {
           methodName: method_name,
+          // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- JSON of the router's arguments, which validateQuote and validateNextSteps check before swapping
           args: JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>,
           gas: gas.toString(),
           deposit,
@@ -156,6 +186,8 @@ async function fetchOutcome(
   request: TraderSwapRequest,
   quote: Quote,
   txHashes: string[],
+  retryDelayMs: { min: number; max: number },
+  outcomeTimeoutMs: number,
 ): Promise<SwapOutcome> {
   const params = new URLSearchParams({
     token_in: request.tokenIn,
@@ -164,24 +196,25 @@ async function fetchOutcome(
     tx_hashes: txHashes.join(","),
     fee_amount: quote.fee_amount,
   });
-  const deadline = Date.now() + OUTCOME_TIMEOUT_MS;
+  const deadline = Date.now() + outcomeTimeoutMs;
   for (let failedAttempts = 0; ; failedAttempts += 1) {
     let error: string;
-    let requestIsWrong = false;
+    let status: number | null = null;
     try {
       const response = await fetch(`${routerUrl}/route/outcome?${params}`, {
         signal: AbortSignal.timeout(Math.max(0, deadline - Date.now())),
       });
       if (response.ok) {
+        // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- validateNextSteps checks it before anything is signed
         return (await response.json()) as SwapOutcome;
       }
       error = (await response.text()) || `HTTP ${response.status}`;
-      requestIsWrong = response.status >= 400 && response.status < 500 && response.status !== 429;
+      status = response.status;
     } catch (fetchError) {
       error = fetchError instanceof Error ? fetchError.message : String(fetchError);
     }
-    const delay = retryDelay(RETRY_DELAY_MS, failedAttempts);
-    if (requestIsWrong || Date.now() + delay >= deadline) {
+    const delay = retryDelay(retryDelayMs, failedAttempts);
+    if (requestIsWrong(status) || Date.now() + delay >= deadline) {
       throw new Error(`Couldn't find out what the swap did: ${error}`);
     }
     await new Promise((resolve) => setTimeout(resolve, delay));

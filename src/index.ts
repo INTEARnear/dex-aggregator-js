@@ -6,10 +6,11 @@ export {
   type RouterConnectionOptions,
   type SubscribeOptions,
   type WebSocketLike,
-} from "./connection.js";
-export { routeQuery } from "./request.js";
+} from "./connection.ts";
+export { routeQuery } from "./request.ts";
 export {
   ROUTER_URL,
+  SwapInterruptedError,
   swapWithNearConnect,
   swapWithSigner,
   toTransactions,
@@ -17,12 +18,13 @@ export {
   type Signer,
   type SwapProgress,
   type SwapResult,
-} from "./swap.js";
-export type * from "./types.js";
+} from "./swap.ts";
+export type * from "./types.ts";
 export {
+  MAX_ORACLE_FEES,
   MAX_STORAGE_DEPOSIT_FOR_OTHERS,
   MAX_STORAGE_DEPOSITS,
   UnsafeTransactionsError,
   validateNextSteps,
   validateQuote,
-} from "./validate.js";
+} from "./validate.ts";

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { RouterConnection } from "../src/connection.js";
-import { swapWithNearConnect, swapWithSigner, type NearConnectWallet } from "../src/swap.js";
-import type { SwapOutcome, Transaction } from "../src/types.js";
-import { UnsafeTransactionsError } from "../src/validate.js";
-import { call, quoteOf, transaction, withFeesInNextSteps } from "./helpers.js";
-import { REQUESTS } from "./requests.js";
+import type { RouterConnection } from "../src/connection.ts";
+import { SwapInterruptedError, swapWithNearConnect, swapWithSigner, type NearConnectWallet } from "../src/swap.ts";
+import type { SwapOutcome, Transaction } from "../src/types.ts";
+import { UnsafeTransactionsError } from "../src/validate.ts";
+import { call, quoteOf, transaction, withFeesInNextSteps } from "./helpers.ts";
+import { REQUESTS } from "./requests.ts";
 
 const request = REQUESTS["near_to_usdc_exact_in"]!;
 const quote = quoteOf("near_to_usdc_exact_in", "RheaDcl");
@@ -110,7 +110,7 @@ describe("swapping with near-connect", () => {
 
   test("tells the hashes of the swap's transactions", async () => {
     answerOutcome(swapped);
-    const sent: string[][] = [];
+    const sent: (readonly string[])[] = [];
     await swapWithNearConnect({
       wallet: recordingWallet(),
       request,
@@ -133,6 +133,21 @@ describe("swapping with near-connect", () => {
     expect(fetch).toHaveBeenCalledTimes(3);
   });
 
+  test("gives up on the outcome after its timeout", async () => {
+    const fetch = vi.fn(async () => new Response("Failed to get the transaction", { status: 502 }));
+    vi.stubGlobal("fetch", fetch);
+    const swap = swapWithNearConnect({
+      wallet: recordingWallet(),
+      request,
+      quote,
+      routerUrl: "https://router.test",
+      retryDelayMs: { min: 10, max: 20 },
+      outcomeTimeoutMs: 100,
+    });
+    await expect(swap).rejects.toThrow("Couldn't find out what the swap did: Failed to get the transaction");
+    expect(fetch.mock.calls.length).toBeGreaterThan(1);
+  });
+
   test("doesn't ask again for the outcome of a request that's wrong", async () => {
     const fetch = vi.fn(async () => new Response("Transaction tx1-0 is signed by other.near, not intear.near", { status: 400 }));
     vi.stubGlobal("fetch", fetch);
@@ -146,11 +161,11 @@ describe("swapping with near-connect", () => {
 });
 
 test("swapping with a signer tells the hashes of the swap's transactions", async () => {
-  const quote = withFeesInNextSteps(quoteOf("near_to_usdc_exact_in", "RheaDcl"));
+  const signerQuote = withFeesInNextSteps(quoteOf("near_to_usdc_exact_in", "RheaDcl"));
   const signed: Transaction[] = [];
   const signer = {
-    signAndSendTransaction: async (transaction: Transaction) => {
-      signed.push(transaction);
+    signAndSendTransaction: async (signedTransaction: Transaction) => {
+      signed.push(signedTransaction);
       return `tx${signed.length}`;
     },
   };
@@ -161,10 +176,39 @@ test("swapping with a signer tells the hashes of the swap's transactions", async
       return swapped;
     },
   } as unknown as RouterConnection;
-  const sent: string[][] = [];
-  const result = await swapWithSigner({ signer, connection, request, quote, onSwapSent: (txHashes) => sent.push(txHashes) });
-  const txHashes = quote.execution_instructions.map((_, index) => `tx${index + 1}`);
+  const sent: (readonly string[])[] = [];
+  const result = await swapWithSigner({
+    signer,
+    connection,
+    request,
+    quote: signerQuote,
+    onSwapSent: (txHashes) => sent.push(txHashes),
+  });
+  const txHashes = signerQuote.execution_instructions.map((_, index) => `tx${index + 1}`);
   expect(sent).toEqual([txHashes]);
-  expect(asked).toEqual([[quote.quote_id, txHashes]]);
+  expect(asked).toEqual([[signerQuote.quote_id, txHashes]]);
   expect(result).toEqual({ outcome: swapped, nextStepsError: null });
+});
+
+test("swapping with a signer that fails on a transaction tells the ones that executed before it", async () => {
+  const rheaBalances = REQUESTS["rhea_balances_exact_in"]!;
+  const signerQuote = withFeesInNextSteps(quoteOf("rhea_balances_exact_in", "RheaDcl"));
+  expect(signerQuote.execution_instructions).toHaveLength(2);
+  const failure = new Error("Nonce too low");
+  let signed = 0;
+  const signer = {
+    signAndSendTransaction: async () => {
+      signed += 1;
+      if (signed === 2) {
+        throw failure;
+      }
+      return `tx${signed}`;
+    },
+  };
+  const outcome = vi.fn(async () => swapped);
+  const connection = { outcome } as unknown as RouterConnection;
+  const swap = swapWithSigner({ signer, connection, request: rheaBalances, quote: signerQuote });
+  await expect(swap).rejects.toThrow(SwapInterruptedError);
+  await expect(swap).rejects.toMatchObject({ txHashes: ["tx1"], cause: failure });
+  expect(outcome).not.toHaveBeenCalled();
 });

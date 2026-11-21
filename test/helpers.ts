@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
-import type { ExecutionInstruction, Quote, RouterAction } from "../src/types.js";
+import type { ExecutionInstruction, Quote, RouterAction } from "../src/types.ts";
 
 export function fixture(name: string): Quote[] {
   return JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8")) as Quote[];
 }
 
 export function quoteOf(name: string, dexId: string): Quote {
-  const quote = fixture(name).find((quote) => quote.dex_id === dexId);
+  const quote = fixture(name).find((candidate) => candidate.dex_id === dexId);
   if (quote === undefined) {
     throw new Error(`${name} has no ${dexId} quote`);
   }
@@ -18,7 +18,7 @@ export function encodeArgs(args: unknown): string {
 }
 
 export function decodeArgs(args: string): Record<string, unknown> {
-  return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(args), (char) => char.charCodeAt(0))));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(args), (char) => char.charCodeAt(0)))) as Record<string, unknown>;
 }
 
 export function call(method: string, args: unknown, deposit = "1", gas = 30_000_000_000_000): RouterAction {

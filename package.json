@@ -18,9 +18,11 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "check": "tsc --noEmit -p tsconfig.test.json",
-    "test": "vitest run"
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "lint": "oxlint --type-aware --deny-warnings",
+    "test": "vitest run",
+    "prepublishOnly": "npm run check && npm run lint && npm test && npm run build"
   },
   "engines": {
     "node": ">=22"
@@ -28,6 +30,8 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2008",
     "typescript": "^7.0.2",
     "vitest": "^5.1.1",
     "ws": "^8.23.0"

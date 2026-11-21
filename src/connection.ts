@@ -1,6 +1,6 @@
-import { routeQuery } from "./request.js";
-import type { Quote, SwapOutcome, SwapRequest } from "./types.js";
-import { UnsafeTransactionsError, validateQuote } from "./validate.js";
+import { parseToken, routeQuery } from "./request.ts";
+import type { Quote, SwapOutcome, SwapRequest } from "./types.ts";
+import { UnsafeTransactionsError, validateQuote } from "./validate.ts";
 
 export const ROUTER_SUBSCRIBE_URL = "wss://router.intear.tech/route/subscribe";
 export const RETRY_DELAY_MS = { min: 250, max: 10_000 };
@@ -12,15 +12,26 @@ export function retryDelay(delayMs: { min: number; max: number }, failedAttempts
   return Math.min(delayMs.max, delayMs.min * 2 ** failedAttempts);
 }
 
+/** The HTTP status of the router's error says asking again won't help, unlike a rate limit */
+export function requestIsWrong(status: unknown): boolean {
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 429;
+}
+
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
+
+/**
+ * Of an event of a WebSocket. Compared like a method's parameter, so that the handlers of
+ * WebSockets whose events have more in them fit.
+ */
+type EventHandler<Event> = { handle(event: Event): void }["handle"];
 
 /** What the connection needs of a WebSocket: the browser's, Node's, or `ws` */
 export interface WebSocketLike {
   readonly readyState: number;
-  onopen: ((event: unknown) => void) | null;
-  onmessage: ((event: { data: unknown }) => void) | null;
-  onclose: ((event: unknown) => void) | null;
-  onerror: ((event: unknown) => void) | null;
+  onopen: EventHandler<unknown> | null;
+  onmessage: EventHandler<{ data: unknown }> | null;
+  onclose: EventHandler<unknown> | null;
+  onerror: EventHandler<unknown> | null;
   send(data: string): void;
   close(): void;
 }
@@ -44,9 +55,9 @@ export interface RouterConnectionOptions {
 
 export interface QuoteUpdate {
   /** Safe to sign, best first */
-  quotes: Quote[];
+  quotes: readonly Quote[];
   /** Left out, and why */
-  rejected: { quote: Quote; error: UnsafeTransactionsError }[];
+  rejected: readonly { quote: Quote; error: UnsafeTransactionsError }[];
 }
 
 export interface SubscribeOptions {
@@ -57,6 +68,10 @@ export interface SubscribeOptions {
    */
   feesInNextSteps: boolean;
   onQuotes: (update: QuoteUpdate) => void;
+  /**
+   * Of the router's errors, after which the route request is sent again, unless the router says
+   * the request is wrong, which ends the subscription
+   */
   onError?: (error: Error) => void;
 }
 
@@ -76,6 +91,19 @@ interface Subscription {
   message: string;
   request: SwapRequest;
   options: SubscribeOptions;
+  /** Of the route requests that the router answered with an error since its last routes */
+  failedAttempts: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/** What the router sends, before it's checked */
+interface RouterMessage {
+  id?: unknown;
+  routes?: unknown;
+  outcome?: unknown;
+  error?: unknown;
+  /** The HTTP status of the error */
+  status?: unknown;
 }
 
 const OPEN = 1;
@@ -102,8 +130,7 @@ export class RouterConnection {
 
   constructor(options: RouterConnectionOptions = {}) {
     this.#url = options.url ?? ROUTER_SUBSCRIBE_URL;
-    this.#WebSocket =
-      options.WebSocket ?? (globalThis.WebSocket as unknown as new (url: string) => WebSocketLike);
+    this.#WebSocket = options.WebSocket ?? globalThis.WebSocket;
     this.#reconnectDelayMs = options.reconnectDelayMs ?? RETRY_DELAY_MS;
     this.#onStatusChange = options.onStatusChange;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
@@ -123,17 +150,21 @@ export class RouterConnection {
     if (this.#status === "closed") {
       throw new Error("The connection to the router is closed");
     }
+    // Checking its quotes needs the tokens, so a request for others fails here, not on its quotes
+    parseToken(request.tokenIn);
+    parseToken(request.tokenOut);
     const id = this.#nextId++;
     const message = JSON.stringify({
       id,
       query: routeQuery(request),
       fees_in_next_steps: options.feesInNextSteps,
     });
-    this.#subscription = { id, message, request, options };
+    this.#endSubscription();
+    this.#subscription = { id, message, request, options, failedAttempts: 0, retryTimer: null };
     this.#send(message);
     return () => {
       if (this.#subscription?.id === id) {
-        this.#subscription = null;
+        this.#endSubscription();
         this.#send(JSON.stringify({ id: this.#nextId++ }));
       }
     };
@@ -145,7 +176,7 @@ export class RouterConnection {
    */
   outcome(
     quoteId: number,
-    txHashes: string[],
+    txHashes: readonly string[],
     waitUntil: "executed" | "swap" = "executed",
   ): Promise<SwapOutcome> {
     if (this.#status === "closed") {
@@ -180,6 +211,7 @@ export class RouterConnection {
 
   close(): void {
     this.#setStatus("closed");
+    this.#endSubscription();
     if (this.#reconnectTimer !== null) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
@@ -216,11 +248,11 @@ export class RouterConnection {
       clearTimeout(connectTimeout);
       this.#failedAttempts = 0;
       this.#setStatus("open");
-      if (this.#subscription !== null) {
+      // The others are asked for again once they waited after the router's error
+      if (this.#subscription !== null && this.#subscription.retryTimer === null) {
         socket.send(this.#subscription.message);
       }
       for (const pending of this.#outcomes.values()) {
-        // The others are asked for again once they waited after the router's error
         if (pending.retryTimer === null) {
           socket.send(pending.message);
         }
@@ -243,41 +275,71 @@ export class RouterConnection {
   }
 
   #receive(data: string): void {
-    let message: { id?: unknown; routes?: unknown; outcome?: SwapOutcome; error?: string };
+    let message: RouterMessage;
     try {
-      message = JSON.parse(data) as typeof message;
-      if (typeof message !== "object" || message === null) {
+      const parsed: unknown = JSON.parse(data);
+      if (typeof parsed !== "object" || parsed === null) {
         throw new Error("Isn't an object");
       }
+      message = parsed;
     } catch {
       this.#subscription?.options.onError?.(new Error(`The router sent something else than a message: ${data}`));
       return;
     }
-    const pending = typeof message.id === "number" ? this.#outcomes.get(message.id) : undefined;
-    if (pending !== undefined) {
+    const id = typeof message.id === "number" ? message.id : null;
+    const pending = id === null ? undefined : this.#outcomes.get(id);
+    const error = typeof message.error === "string" ? message.error : null;
+    if (id !== null && pending !== undefined) {
       if (message.outcome !== undefined) {
-        this.#finishOutcome(message.id as number, pending);
-        pending.resolve(message.outcome);
+        this.#finishOutcome(id, pending);
+        // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- validateNextSteps checks it before anything is signed
+        pending.resolve(message.outcome as SwapOutcome);
         return;
       }
-      pending.lastError = message.error ?? "The router answered without an outcome";
-      pending.retryTimer = setTimeout(() => {
-        pending.retryTimer = null;
-        this.#send(pending.message);
-      }, retryDelay(this.#reconnectDelayMs, pending.failedAttempts));
-      pending.failedAttempts += 1;
+      const outcomeError = error ?? "The router answered without an outcome";
+      if (requestIsWrong(message.status)) {
+        this.#finishOutcome(id, pending);
+        pending.reject(new Error(`The router can't tell the outcome: ${outcomeError}`));
+        return;
+      }
+      pending.lastError = outcomeError;
+      this.#sendAgainLater(pending);
       return;
     }
     const subscription = this.#subscription;
     // Of an earlier route request
-    if (subscription === null || subscription.id !== message.id) {
+    if (subscription === null || subscription.id !== id) {
       return;
     }
     if (Array.isArray(message.routes)) {
+      subscription.failedAttempts = 0;
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- checkQuotes checks each of them
       subscription.options.onQuotes(checkQuotes(subscription.request, message.routes as Quote[]));
-    } else {
-      subscription.options.onError?.(new Error(message.error ?? "The router answered without routes"));
+      return;
     }
+    // The router stopped routing the request
+    if (requestIsWrong(message.status)) {
+      this.#endSubscription();
+    } else {
+      this.#sendAgainLater(subscription);
+    }
+    subscription.options.onError?.(new Error(error ?? "The router answered without routes"));
+  }
+
+  /** Waits twice as long as after the request's previous error */
+  #sendAgainLater(request: PendingOutcome | Subscription): void {
+    request.retryTimer = setTimeout(() => {
+      request.retryTimer = null;
+      this.#send(request.message);
+    }, retryDelay(this.#reconnectDelayMs, request.failedAttempts));
+    request.failedAttempts += 1;
+  }
+
+  #endSubscription(): void {
+    if (this.#subscription !== null && this.#subscription.retryTimer !== null) {
+      clearTimeout(this.#subscription.retryTimer);
+    }
+    this.#subscription = null;
   }
 
   #finishOutcome(id: number, pending: PendingOutcome): void {
@@ -297,17 +359,18 @@ export class RouterConnection {
 }
 
 function checkQuotes(request: SwapRequest, quotes: Quote[]): QuoteUpdate {
-  const update: QuoteUpdate = { quotes: [], rejected: [] };
+  const safe: Quote[] = [];
+  const rejected: { quote: Quote; error: UnsafeTransactionsError }[] = [];
   for (const quote of quotes) {
     try {
       validateQuote(request, quote);
-      update.quotes.push(quote);
+      safe.push(quote);
     } catch (error) {
       if (!(error instanceof UnsafeTransactionsError)) {
         throw error;
       }
-      update.rejected.push({ quote, error });
+      rejected.push({ quote, error });
     }
   }
-  return update;
+  return { quotes: safe, rejected };
 }

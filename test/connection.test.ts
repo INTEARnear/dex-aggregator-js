@@ -1,10 +1,10 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, test } from "vitest";
-import { WebSocketServer, type WebSocket } from "ws";
-import { RouterConnection, type ConnectionStatus, type QuoteUpdate } from "../src/connection.js";
-import type { Quote, SwapOutcome } from "../src/types.js";
-import { quoteOf, tamper, withFeesInNextSteps } from "./helpers.js";
-import { REQUESTS } from "./requests.js";
+import { WebSocket, WebSocketServer } from "ws";
+import { RouterConnection, type ConnectionStatus, type QuoteUpdate } from "../src/connection.ts";
+import type { SwapOutcome } from "../src/types.ts";
+import { quoteOf, tamper, withFeesInNextSteps } from "./helpers.ts";
+import { REQUESTS } from "./requests.ts";
 
 const REQUEST = REQUESTS["near_to_usdc_exact_in"]!;
 const QUOTE = withFeesInNextSteps(quoteOf("near_to_usdc_exact_in", "RheaDcl"));
@@ -27,29 +27,40 @@ interface ClientMessage {
 
 /**
  * Answers route requests with `routes`, and outcome requests unless `answerOutcomes` is off, with
- * an error the first `failedOutcomes` times
+ * `routeError` the first `failedRoutes` times, and `outcomeError` the first `failedOutcomes` times
  */
 class MockRouter {
   readonly server: WebSocketServer;
   readonly received: ClientMessage[] = [];
   answerOutcomes = true;
+  failedRoutes = 0;
+  routeError = { error: "Rate limit exceeded", status: 429 };
   failedOutcomes = 0;
+  outcomeError = { error: "Rate limit exceeded", status: 429 };
+  readonly routes: unknown[];
 
-  constructor(port: number, readonly routes: unknown[]) {
+  constructor(port: number, routes: unknown[]) {
+    this.routes = routes;
     this.server = new WebSocketServer({ port });
     this.server.on("connection", (socket: WebSocket) => {
       socket.on("message", (data) => {
-        const message = JSON.parse(String(data)) as ClientMessage;
+        // Text frames arrive as a Buffer
+        const message = JSON.parse((data as Buffer).toString()) as ClientMessage;
         this.received.push(message);
         if (message.outcome !== undefined) {
           if (this.failedOutcomes > 0) {
             this.failedOutcomes -= 1;
-            socket.send(JSON.stringify({ id: message.id, error: "Too many requests" }));
+            socket.send(JSON.stringify({ id: message.id, ...this.outcomeError }));
           } else if (this.answerOutcomes) {
             socket.send(JSON.stringify({ id: message.id, outcome: OUTCOME }));
           }
         } else if (message.query !== undefined) {
-          socket.send(JSON.stringify({ id: message.id, routes: this.routes }));
+          if (this.failedRoutes > 0) {
+            this.failedRoutes -= 1;
+            socket.send(JSON.stringify({ id: message.id, ...this.routeError }));
+          } else {
+            socket.send(JSON.stringify({ id: message.id, routes: this.routes }));
+          }
         }
       });
     });
@@ -57,6 +68,10 @@ class MockRouter {
 
   get outcomeRequests(): ClientMessage[] {
     return this.received.filter((message) => message.outcome !== undefined);
+  }
+
+  get routeRequests(): ClientMessage[] {
+    return this.received.filter((message) => message.query !== undefined);
   }
 
   static async start(port: number, routes: unknown[]): Promise<MockRouter> {
@@ -161,6 +176,15 @@ describe("RouterConnection", () => {
     ]);
   });
 
+  test("connects with ws's WebSocket", async () => {
+    const router = await MockRouter.start(0, [QUOTE]);
+    routers.push(router);
+    connection = new RouterConnection({ url: `ws://localhost:${router.port}`, WebSocket });
+    const updates: QuoteUpdate[] = [];
+    connection.subscribe(REQUEST, { feesInNextSteps: true, onQuotes: (update) => updates.push(update) });
+    expect((await nextUpdate(updates)).quotes).toEqual([QUOTE]);
+  });
+
   test("ignores the routes of a route request it replaced", async () => {
     const router = await MockRouter.start(0, [QUOTE]);
     routers.push(router);
@@ -221,13 +245,68 @@ describe("RouterConnection", () => {
       outcomeTimeoutMs: 200,
     });
     await expect(connection.outcome(1, ["7xEDD8Bdu9arQn7dDghTDMzhvuwmiKsRFJovq8LyfVQw"])).rejects.toThrow(
-      "The router didn't tell the outcome in 200 ms: Too many requests",
+      "The router didn't tell the outcome in 200 ms: Rate limit exceeded",
     );
     // Once the last request on its way arrived, it's not asked again
     await new Promise((resolve) => setTimeout(resolve, 50));
     const asked = router.outcomeRequests.length;
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(router.outcomeRequests).toHaveLength(asked);
+  });
+
+  test("fails an outcome at once when the router says the request is wrong", async () => {
+    const router = await MockRouter.start(0, []);
+    routers.push(router);
+    router.failedOutcomes = Infinity;
+    router.outcomeError = { error: "Quote 1 doesn't exist", status: 404 };
+    connection = new RouterConnection({ url: `ws://localhost:${router.port}`, reconnectDelayMs: { min: 10, max: 20 } });
+    await expect(connection.outcome(1, ["7xEDD8Bdu9arQn7dDghTDMzhvuwmiKsRFJovq8LyfVQw"])).rejects.toThrow(
+      "The router can't tell the outcome: Quote 1 doesn't exist",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(router.outcomeRequests).toHaveLength(1);
+  });
+
+  test("asks for the routes again after the router's errors", async () => {
+    const router = await MockRouter.start(0, [QUOTE]);
+    routers.push(router);
+    router.failedRoutes = 2;
+    connection = new RouterConnection({ url: `ws://localhost:${router.port}`, reconnectDelayMs: { min: 10, max: 50 } });
+    const updates: QuoteUpdate[] = [];
+    const errors: Error[] = [];
+    connection.subscribe(REQUEST, {
+      feesInNextSteps: true,
+      onQuotes: (update) => updates.push(update),
+      onError: (error) => errors.push(error),
+    });
+    const update = await nextUpdate(updates);
+    expect(update.quotes).toEqual([QUOTE]);
+    expect(errors.map((error) => error.message)).toEqual(["Rate limit exceeded", "Rate limit exceeded"]);
+    expect(router.routeRequests).toHaveLength(3);
+    expect(new Set(router.routeRequests.map((message) => JSON.stringify(message))).size).toBe(1);
+  });
+
+  test("ends the subscription when the router says the request is wrong", async () => {
+    const router = await MockRouter.start(0, [QUOTE]);
+    routers.push(router);
+    router.failedRoutes = Infinity;
+    router.routeError = { error: "Slippage must be between 0.00 and 1.00", status: 400 };
+    connection = new RouterConnection({ url: `ws://localhost:${router.port}`, reconnectDelayMs: { min: 10, max: 20 } });
+    const errors: Error[] = [];
+    connection.subscribe(REQUEST, { feesInNextSteps: true, onQuotes: () => {}, onError: (error) => errors.push(error) });
+    const error = await waitFor(() => errors[0]);
+    expect(error.message).toBe("Slippage must be between 0.00 and 1.00");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(router.routeRequests).toHaveLength(1);
+  });
+
+  test("subscribing to a token that the router doesn't name throws", async () => {
+    const router = await MockRouter.start(0, []);
+    routers.push(router);
+    connection = new RouterConnection({ url: `ws://localhost:${router.port}` });
+    expect(() =>
+      connection!.subscribe({ ...REQUEST, tokenOut: "intear-dex:usdc" }, { feesInNextSteps: true, onQuotes: () => {} }),
+    ).toThrow("Intear DEX only has NEAR and NEP-141s, not intear-dex:usdc");
   });
 
   test("gives up on an outcome the router doesn't answer", async () => {

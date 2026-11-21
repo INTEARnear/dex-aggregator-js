@@ -1,4 +1,4 @@
-import { WRAP_NEAR, intearAssets, parseToken, type Token } from "./request.js";
+import { WRAP_NEAR, intearAssets, parseToken, type Token } from "./request.ts";
 import type {
   ExecutionInstruction,
   Quote,
@@ -6,7 +6,7 @@ import type {
   RouterAmount,
   SwapOutcome,
   SwapRequest,
-} from "./types.js";
+} from "./types.ts";
 
 const RHEA = "v2.ref-finance.near";
 const RHEA_DCL = "dclv2.ref-labs.near";
@@ -32,12 +32,26 @@ export const MAX_STORAGE_DEPOSITS = 1_000_000_000_000_000_000_000_000n; // 1 NEA
  * withdraw them. A fee receiver new to Rhea takes 0.0112 NEAR.
  */
 export const MAX_STORAGE_DEPOSIT_FOR_OTHERS = 50_000_000_000_000_000_000_000n; // 0.05 NEAR
+/**
+ * The most that the trader pays Intear DEX's oracles of each asset of the input, out of it or by a
+ * swap that buys their fee with it. Oracles aren't paid with other assets.
+ */
+export const MAX_ORACLE_FEES: ReadonlyMap<string, bigint> = new Map([
+  ["near", 1_000_000_000_000_000_000_000_000n], // 1 NEAR
+  [`nep141:${WRAP_NEAR}`, 1_000_000_000_000_000_000_000_000n], // 1 NEAR
+  ["nep141:usdt.tether-token.near", 1_000_000n], // 1 USDT
+  ["nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1", 1_000_000n], // 1 USDC
+  ["nep141:token.intear.near", 1_000_000_000_000_000_000_000_000_000n], // 1000 TEAR
+]);
 
 /** What makes the router's transactions unsafe to sign, one problem each */
 export class UnsafeTransactionsError extends Error {
-  constructor(readonly problems: string[]) {
+  readonly problems: readonly string[];
+
+  constructor(problems: readonly string[]) {
     super(`The router's transactions aren't safe to sign: ${problems.join("; ")}`);
     this.name = "UnsafeTransactionsError";
+    this.problems = problems;
   }
 }
 
@@ -103,6 +117,9 @@ type Phase = "quote" | "nextSteps";
 type Json = Record<string, unknown>;
 
 class TransactionChecker {
+  readonly request: SwapRequest;
+  readonly quote: Quote;
+  readonly phase: Phase;
   readonly #problems: string[] = [];
   readonly #tokenIn: Token;
   readonly #tokenOut: Token;
@@ -117,21 +134,22 @@ class TransactionChecker {
   #walletFees = 0n;
   /** Paid out of the balance of the input on Rhea */
   #rheaFees = 0n;
+  /** Taken by Intear DEX at most, out of the input of its operations */
+  #intearDexFees = 0n;
   #storageDeposits = 0n;
   /** Of accounts other than the trader, which they can withdraw */
   readonly #othersRheaStorage = new Map<string, bigint>();
   /** Native NEAR made into wNEAR */
   #wrapped = 0n;
-  /** What the swaps give at least, of exact-in */
+  /** What the swaps give at least */
   #guaranteedOutput = 0n;
   #swaps = 0;
   #quoteImprovementFee = 0n;
 
-  constructor(
-    readonly request: SwapRequest,
-    readonly quote: Quote,
-    readonly phase: Phase,
-  ) {
+  constructor(request: SwapRequest, quote: Quote, phase: Phase) {
+    this.request = request;
+    this.quote = quote;
+    this.phase = phase;
     this.#tokenIn = parseToken(request.tokenIn);
     this.#tokenOut = parseToken(request.tokenOut);
     this.#inputAssets = intearAssets(this.#tokenIn);
@@ -157,7 +175,7 @@ class TransactionChecker {
   }
 
   get #exactIn(): boolean {
-    return "exactIn" in this.request.amount;
+    return this.request.amount.exactIn !== undefined;
   }
 
   /** What the quote estimates: the output of exact-in, the input of exact-out */
@@ -212,12 +230,13 @@ class TransactionChecker {
   quoteTotals(feesInNextSteps: boolean): void {
     // What the trader allows the swap to take
     const maxInput =
-      "exactIn" in this.request.amount
-        ? this.request.amount.exactIn
-        : amountOf(this.quote.worst_case_amount, "amount_in");
-    if (this.#spent > maxInput) {
+      this.request.amount.exactIn ?? amountOf(this.quote.worst_case_amount, "amount_in");
+    const feeAmount = bigint(this.quote.fee_amount, "fee_amount");
+    // The fee transactions of the next steps pay the fee amount after these
+    const spent = feesInNextSteps ? this.#spent + feeAmount : this.#spent;
+    if (spent > maxInput) {
       this.problem(
-        `The transactions spend ${this.#spent} of the input, more than the ${maxInput} the trader allows`,
+        `The transactions spend ${spent} of the input, more than the ${maxInput} the trader allows`,
       );
     }
     const storageDeposits = bigint(this.quote.storage_deposits, "storage_deposits");
@@ -230,7 +249,6 @@ class TransactionChecker {
     if (this.#wrapped > 0n && !(this.#tokenIn.contract === WRAP_NEAR && this.#wrapped <= maxInput)) {
       this.problem(`The transactions wrap ${this.#wrapped} NEAR, which isn't the input`);
     }
-    const feeAmount = bigint(this.quote.fee_amount, "fee_amount");
     if (!feesInNextSteps && this.#walletFees !== feeAmount) {
       this.problem(
         `The fee transactions pay ${this.#walletFees}, not the quote's fee amount of ${feeAmount}`,
@@ -238,18 +256,21 @@ class TransactionChecker {
     }
     const maxFees =
       (maxInput * this.#requestedFee) / FULL_FEE_FRACTION + BigInt(this.#feeReceivers.size);
-    const fees = feeAmount + this.#rheaFees;
+    const fees = feeAmount + this.#rheaFees + this.#intearDexFees;
     if (fees > maxFees) {
       this.problem(`The fees of ${fees} are more than the requested fees of at most ${maxFees}`);
     }
     if (this.#swaps === 0 && this.#tokenIn.contract !== this.#tokenOut.contract) {
       this.problem("The transactions don't swap");
     }
-    if (this.#exactIn && this.#swaps > 0) {
-      const worstCase = amountOf(this.quote.worst_case_amount, "amount_out");
-      if (this.#guaranteedOutput < worstCase) {
+    if (this.#swaps > 0) {
+      const [leastOutput, leastOutputName] =
+        this.request.amount.exactOut === undefined
+          ? [amountOf(this.quote.worst_case_amount, "amount_out"), "the quote's worst case"]
+          : [this.request.amount.exactOut, "the requested output"];
+      if (this.#guaranteedOutput < leastOutput) {
         this.problem(
-          `The swaps guarantee ${this.#guaranteedOutput} of the output, less than the quote's worst case of ${worstCase}`,
+          `The swaps guarantee ${this.#guaranteedOutput} of the output, less than ${leastOutputName} of ${leastOutput}`,
         );
       }
     }
@@ -361,7 +382,7 @@ class TransactionChecker {
         const swap = parseJson(msg, "msg");
         if (receiverId === RHEA) {
           onlyKeys(swap, ["force", "actions", "skip_degen_price_sync", "skip_unwrap_near", "referral_id"]);
-          this.#rheaActions(swap["actions"]);
+          this.#rheaActions(array(swap["actions"], "actions"));
         } else if (receiverId === RHEA_DCL) {
           this.#rheaDclSwap(swap);
         } else if (receiverId === INTEAR_DEX) {
@@ -444,7 +465,7 @@ class TransactionChecker {
         if (this.#tokenIn.place !== "rhea") {
           throw new Error("Swaps the trader's balance on Rhea, which isn't where the input is");
         }
-        this.#spent += this.#rheaActions(args["actions"]);
+        this.#spent += this.#rheaActions(array(args["actions"], "actions"));
         return;
       }
       case "mft_transfer": {
@@ -477,12 +498,12 @@ class TransactionChecker {
   }
 
   /** The input that the actions swap, adding up the least output they give */
-  #rheaActions(actions: unknown): bigint {
+  #rheaActions(actions: unknown[]): bigint {
     // Rhea's actions only guarantee an output of exact-in, which routes only swap there
     if (!this.#exactIn) {
       throw new Error("Swaps exact-out on Rhea, which routes don't");
     }
-    if (!Array.isArray(actions) || actions.length === 0) {
+    if (actions.length === 0) {
       throw new Error("Has no swap actions");
     }
     let swapped = 0n;
@@ -499,8 +520,8 @@ class TransactionChecker {
         throw new Error("An action doesn't swap what the one before it gave");
       }
       previousTokenOut = step["token_out"];
-      const next = actions[index + 1] as Json | undefined;
-      if (next === undefined || next["amount_in"] !== undefined) {
+      const next: unknown = actions[index + 1];
+      if (next === undefined || object(next, "action")["amount_in"] !== undefined) {
         if (step["token_out"] !== this.#tokenOut.contract) {
           throw new Error(`A path ends in ${String(step["token_out"])}, which isn't the output`);
         }
@@ -518,20 +539,21 @@ class TransactionChecker {
     this.#storageDeposits += attached;
   }
 
-  #rheaDclSwap(message: Json): void {
-    const [kind, swap] = singleEntry(message);
+  #rheaDclSwap(msg: Json): void {
+    const [kind, swap] = singleEntry(msg);
     const fields = object(swap, kind);
     if (fields["output_token"] !== this.#tokenOut.contract) {
       throw new Error(`Swaps to ${String(fields["output_token"])}, which isn't the output`);
     }
-    if (kind === "Swap" && "exactIn" in this.request.amount) {
+    if (kind === "Swap" && this.#exactIn) {
       onlyKeys(fields, ["pool_ids", "output_token", "min_output_amount", "skip_unwrap_near", "referral_id"]);
       this.#guaranteedOutput += bigint(fields["min_output_amount"], "min_output_amount");
-    } else if (kind === "SwapByOutput" && "exactOut" in this.request.amount) {
+    } else if (kind === "SwapByOutput" && this.request.amount.exactOut !== undefined) {
       onlyKeys(fields, ["pool_ids", "output_token", "output_amount", "skip_unwrap_near", "referral_id"]);
       if (bigint(fields["output_amount"], "output_amount") !== this.request.amount.exactOut) {
         throw new Error("Swaps for another amount than the requested output");
       }
+      this.#guaranteedOutput += this.request.amount.exactOut;
     } else {
       throw new Error(`${kind} isn't the swap the request asks for`);
     }
@@ -593,48 +615,55 @@ class TransactionChecker {
   #engineOperations(args: Json): bigint {
     // A fee discount only lowers the swaps' pool fees, and the engine checks its signature
     onlyKeys(args, ["operations", "referrer", "referral_fees", "fee_discount"]);
-    this.#engineReferralFees(args["referral_fees"]);
-    const operations = args["operations"];
-    if (!Array.isArray(operations)) {
-      throw new Error("Has no operations");
-    }
+    const referralFee = this.#engineReferralFees(args["referral_fees"]);
+    const operations = array(args["operations"], "operations").map((entry) => {
+      const [kind, value] = singleEntry(object(entry, "operation"));
+      return { kind, operation: object(value, kind) };
+    });
     let taken = 0n;
     let previousSwap: Json | undefined;
-    operations.forEach((entry: unknown, index) => {
-      const next: unknown = operations[index + 1];
-      const [kind, value] = singleEntry(object(entry, "operation"));
-      const operation = object(value, kind);
+    operations.forEach(({ kind, operation }, index) => {
+      const next = operations[index + 1];
+      const feedsNextSwap =
+        (next?.kind === "SwapSimple" || next?.kind === "SwapAdvanced") &&
+        next.operation["amount"] === "OutputOfLastIn";
       switch (kind) {
         case "OracleRequest": {
           onlyKeys(operation, ["oracle_key", "dex_id", "request", "fee", "swap"]);
-          const fee = operation["fee"];
-          if (!Array.isArray(fee) || fee.length !== 2) {
+          const fee = array(operation["fee"], "The oracle request's fee");
+          if (fee.length !== 2) {
             throw new Error("The oracle request has no fee");
           }
           if (operation["swap"] === null) {
-            if (!this.#inputAssets.includes(fee[0])) {
+            const feeAsset = string(fee[0], "The oracle fee's asset");
+            if (!this.#inputAssets.includes(feeAsset)) {
               throw new Error("Pays the oracle in something else than the input");
             }
-            taken += bigint(fee[1], "oracle fee");
+            const oracleFee = bigint(fee[1], "oracle fee");
+            oracleFeeWithinLimit(feeAsset, oracleFee);
+            taken += oracleFee;
             break;
           }
           // Buys the oracle's fee with at most `constraint` of the input
           const feeSwap = object(operation["swap"], "The oracle fee's swap");
           onlyKeys(feeSwap, ["dex_id", "message", "asset_in", "constraint"]);
-          if (!this.#inputAssets.includes(feeSwap["asset_in"] as string)) {
+          const assetIn = string(feeSwap["asset_in"], "The oracle fee's swap's asset_in");
+          if (!this.#inputAssets.includes(assetIn)) {
             throw new Error("Buys the oracle fee with something else than the input");
           }
-          taken += bigint(feeSwap["constraint"], "The most the oracle fee's swap takes");
+          const mostSwapped = bigint(feeSwap["constraint"], "The most the oracle fee's swap takes");
+          oracleFeeWithinLimit(assetIn, mostSwapped);
+          taken += mostSwapped;
           break;
         }
         case "SwapSimple": {
           onlyKeys(operation, ["dex_id", "message", "asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee"]);
-          taken += this.#engineSwap(operation, previousSwap, next);
+          taken += this.#engineSwap(operation, previousSwap, feedsNextSwap);
           break;
         }
         case "SwapAdvanced": {
           onlyKeys(operation, ["asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee", "options", "mode"]);
-          taken += this.#engineSwap(operation, previousSwap, next);
+          taken += this.#engineSwap(operation, previousSwap, feedsNextSwap);
           break;
         }
         case "Withdraw": {
@@ -650,6 +679,8 @@ class TransactionChecker {
       }
       previousSwap = kind === "SwapSimple" || kind === "SwapAdvanced" ? operation : undefined;
     });
+    // Out of an exact-in swap's input, or on top of an exact-out one's within its constraint
+    this.#intearDexFees += (taken * referralFee) / FULL_FEE_FRACTION;
     return taken;
   }
 
@@ -657,7 +688,7 @@ class TransactionChecker {
    * What the swap takes at most of the input. Exact-in swaps can be chained: each swap of
    * `OutputOfLastIn` swaps what the one before it gave, and only the last one is constrained.
    */
-  #engineSwap(operation: Json, previousSwap: Json | undefined, next: unknown): bigint {
+  #engineSwap(operation: Json, previousSwap: Json | undefined, feedsNextSwap: boolean): bigint {
     let taken = 0n;
     if (operation["amount"] === "OutputOfLastIn") {
       if (!this.#exactIn) {
@@ -667,14 +698,14 @@ class TransactionChecker {
         throw new Error("Swaps something else than what the swap before it gave");
       }
     } else {
-      if (!this.#inputAssets.includes(operation["asset_in"] as string)) {
+      if (!this.#inputAssets.includes(string(operation["asset_in"], "asset_in"))) {
         throw new Error("Swaps something else than the input");
       }
       const amount = object(object(operation["amount"], "amount")["Amount"], "Amount");
       const [kind, value] = singleEntry(amount);
-      if (kind === "ExactIn" && "exactIn" in this.request.amount) {
+      if (kind === "ExactIn" && this.#exactIn) {
         taken = bigint(value, "ExactIn");
-      } else if (kind === "ExactOut" && "exactOut" in this.request.amount) {
+      } else if (kind === "ExactOut" && this.request.amount.exactOut !== undefined) {
         if (bigint(value, "ExactOut") !== this.request.amount.exactOut) {
           throw new Error("Swaps for another amount than the requested output");
         }
@@ -682,21 +713,20 @@ class TransactionChecker {
         throw new Error(`${kind} isn't the swap the request asks for`);
       }
     }
-    const nextOperation = next as Json | undefined;
-    const nextSwap = (nextOperation?.["SwapSimple"] ?? nextOperation?.["SwapAdvanced"]) as Json | undefined;
-    if (nextSwap?.["amount"] === "OutputOfLastIn") {
+    if (feedsNextSwap) {
       if (operation["constraint"] !== null || operation["quote_improvement_fee"] !== null) {
         throw new Error("Constrains a swap before the last one of a chain, which routes don't");
       }
       return taken;
     }
-    if (!this.#outputAssets.includes(operation["asset_out"] as string)) {
+    if (!this.#outputAssets.includes(string(operation["asset_out"], "asset_out"))) {
       throw new Error("Swaps to something else than the output");
     }
     const constraint = bigint(operation["constraint"], "constraint");
     this.#engineQuoteImprovementFee(operation["quote_improvement_fee"]);
-    if (!this.#exactIn) {
-      // The most that an exact-out swap takes
+    if (this.request.amount.exactOut !== undefined) {
+      // Gives exactly the requested output, taking at most the constraint
+      this.#guaranteedOutput += this.request.amount.exactOut;
       return constraint;
     }
     this.#guaranteedOutput += constraint;
@@ -720,27 +750,28 @@ class TransactionChecker {
     }
   }
 
-  #engineReferralFees(fees: unknown): void {
+  /** In millionths of the input */
+  #engineReferralFees(fees: unknown): bigint {
     if (fees === undefined) {
-      return;
-    }
-    if (!Array.isArray(fees)) {
-      throw new Error("Referral fees aren't a list");
+      return 0n;
     }
     let total = 0n;
-    for (const fee of fees) {
-      if (!Array.isArray(fee) || fee.length !== 2) {
+    for (const fee of array(fees, "referral_fees")) {
+      const receiverAndFraction = array(fee, "A referral fee");
+      if (receiverAndFraction.length !== 2) {
         throw new Error("A referral fee isn't a receiver and a fraction");
       }
-      this.#feeReceiver(string(fee[0], "referral fee receiver"));
-      if (!Number.isSafeInteger(fee[1]) || fee[1] < 0) {
+      const [receiver, fraction] = receiverAndFraction;
+      this.#feeReceiver(string(receiver, "referral fee receiver"));
+      if (typeof fraction !== "number" || !Number.isSafeInteger(fraction) || fraction < 0) {
         throw new Error("A referral fee isn't millionths of the input");
       }
-      total += BigInt(fee[1]);
+      total += BigInt(fraction);
     }
     if (total > this.#requestedFee) {
       throw new Error(`Referral fees of ${total} millionths are more than the requested ${this.#requestedFee}`);
     }
+    return total;
   }
 
   #swapCall(): void {
@@ -804,7 +835,7 @@ function parseJson(json: string, what: string): Json {
   try {
     return object(JSON.parse(json), what);
   } catch (error) {
-    throw new Error(`${what} isn't JSON: ${message(error)}`);
+    throw new Error(`${what} isn't JSON: ${message(error)}`, { cause: error });
   }
 }
 
@@ -812,7 +843,15 @@ function object(value: unknown, what: string): Json {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${what} isn't an object`);
   }
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the keys of a JSON object are strings
   return value as Json;
+}
+
+function array(value: unknown, what: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${what} isn't a list`);
+  }
+  return value;
 }
 
 function string(value: unknown, what: string): string {
@@ -831,10 +870,11 @@ function bigint(value: unknown, what: string): bigint {
 
 function singleEntry(value: Json): [string, unknown] {
   const entries = Object.entries(value);
-  if (entries.length !== 1) {
+  const [entry] = entries;
+  if (entry === undefined || entries.length > 1) {
     throw new Error(`Has ${entries.length} variants instead of one`);
   }
-  return entries[0] as [string, unknown];
+  return entry;
 }
 
 /** Routes call contracts with exactly these arguments, so anything else is someone else's */
@@ -848,6 +888,16 @@ function onlyKeys(value: Json, keys: string[]): void {
 function oneYocto(attached: bigint): void {
   if (attached > 1n) {
     throw new Error(`Attaches ${attached}, where routes attach at most 1 yoctoNEAR`);
+  }
+}
+
+function oracleFeeWithinLimit(asset: string, amount: bigint): void {
+  const limit = MAX_ORACLE_FEES.get(asset);
+  if (limit === undefined) {
+    throw new Error(`Pays an oracle with ${asset}, which oracles aren't paid with`);
+  }
+  if (amount > limit) {
+    throw new Error(`Pays an oracle ${amount} of ${asset}, more than ${limit}`);
   }
 }
 

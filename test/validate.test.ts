@@ -1,6 +1,6 @@
-import { describe, expect, test } from "vitest";
-import type { Quote, SwapOutcome } from "../src/types.js";
-import { UnsafeTransactionsError, validateNextSteps, validateQuote } from "../src/validate.js";
+import { describe, expect, expectTypeOf, test } from "vitest";
+import type { Quote, SwapOutcome, SwapRequest } from "../src/types.ts";
+import { UnsafeTransactionsError, validateNextSteps, validateQuote } from "../src/validate.ts";
 import {
   call,
   fixture,
@@ -9,22 +9,22 @@ import {
   tamperJson,
   transaction,
   withFeesInNextSteps,
-} from "./helpers.js";
-import { REQUESTS, USDC } from "./requests.js";
+} from "./helpers.ts";
+import { REQUESTS, USDC } from "./requests.ts";
 
 const NEAR_TO_USDC = REQUESTS["near_to_usdc_exact_in"]!;
 
 /** The operation of a kind in the arguments of a `deposit_near` to Intear DEX */
 function engineOperation(args: Record<string, unknown>, kind: string): Record<string, unknown> {
   const operations = (args["operations"] as Record<string, unknown>)["operations"] as Record<string, Record<string, unknown>>[];
-  const operation = operations.find((operation) => kind in operation)?.[kind];
+  const operation = operations.find((candidate) => kind in candidate)?.[kind];
   if (operation === undefined) {
     throw new Error(`No ${kind} operation`);
   }
   return operation;
 }
 
-function problemsOf(check: () => void): string[] {
+function problemsOf(check: () => void): readonly string[] {
   try {
     check();
   } catch (error) {
@@ -41,12 +41,21 @@ function expectUnsafe(quote: Quote, problem: RegExp, request = NEAR_TO_USDC): vo
   expect(problems, problems.join("\n")).toContainEqual(expect.stringMatching(problem));
 }
 
+test("a request has one amount", () => {
+  expectTypeOf<{ exactIn: bigint }>().toExtend<SwapRequest["amount"]>();
+  expectTypeOf<{ exactOut: bigint }>().toExtend<SwapRequest["amount"]>();
+  expectTypeOf<{ exactIn: bigint; exactOut: bigint }>().not.toExtend<SwapRequest["amount"]>();
+});
+
 describe("quotes of router.intear.tech", () => {
   const cases = Object.entries(REQUESTS).flatMap(([name, request]) =>
     fixture(name).map((quote) => [`${name} on ${quote.dex_id}`, request, quote] as const),
   );
   test.each(cases)("%s is safe to sign", (_, request, quote) => {
     expect(problemsOf(() => validateQuote(request, quote))).toEqual([]);
+  });
+  test.each(cases)("%s is safe to sign with its fees in the next steps", (_, request, quote) => {
+    expect(problemsOf(() => validateQuote(request, withFeesInNextSteps(quote)))).toEqual([]);
   });
 });
 
@@ -234,6 +243,70 @@ describe("tampered quotes", () => {
     );
   });
 
+  test("paying an oracle more than 1 NEAR", () => {
+    expectUnsafe(
+      tamper(intearDex, 0, 0, (args) => {
+        engineOperation(args, "OracleRequest")["fee"] = ["near", "1000000000000000000000001"];
+      }),
+      /Pays an oracle 1000000000000000000000001 of near, more than 1000000000000000000000000/,
+    );
+  });
+
+  test("buying the oracle fee with more than 1 NEAR", () => {
+    expectUnsafe(
+      tamper(intearDex, 0, 0, (args) => {
+        const oracleRequest = engineOperation(args, "OracleRequest");
+        oracleRequest["fee"] = [`nep141:${USDC}`, "1000"];
+        oracleRequest["swap"] = {
+          dex_id: "slimedragon.near/xyk",
+          message: "",
+          asset_in: "near",
+          constraint: "1000000000000000000000001",
+        };
+      }),
+      /Pays an oracle 1000000000000000000000001 of near, more than 1000000000000000000000000/,
+    );
+  });
+
+  test("paying an oracle with an asset that oracles aren't paid with", () => {
+    const request = { ...REQUESTS["intear_balances_exact_in"]!, tokenIn: "intear-dex:nep141:meme.near" };
+    const quote = tamper(quoteOf("intear_balances_exact_in", "IntearDex"), 0, 0, (args) => {
+      const operations = args["operations"] as Record<string, Record<string, unknown>>[];
+      operations.find((operation) => "OracleRequest" in operation)!["OracleRequest"]!["fee"] = ["nep141:meme.near", "1"];
+    });
+    expectUnsafe(quote, /Pays an oracle with nep141:meme\.near, which oracles aren't paid with/, request);
+  });
+
+  test("exact-out on Intear DEX without a swap", () => {
+    const quote = tamper(quoteOf("near_to_usdc_exact_out", "IntearDex"), 0, 0, (args) => {
+      (args["operations"] as Record<string, unknown>)["operations"] = [];
+    });
+    expectUnsafe(
+      quote,
+      /The swaps guarantee 0 of the output, less than the requested output of 2000000/,
+      REQUESTS["near_to_usdc_exact_out"],
+    );
+  });
+
+  test("referral fees on Intear DEX on top of fee transactions", () => {
+    const fee = 5_000_000_000_000_000_000_000n;
+    const quote = tamper(intearDex, 0, 0, (args, action) => {
+      action.deposit = (BigInt(action.deposit) - fee).toString();
+      const amount = engineOperation(args, "SwapAdvanced")["amount"] as { Amount: { ExactIn: string } };
+      amount.Amount.ExactIn = (BigInt(amount.Amount.ExactIn) - fee).toString();
+    });
+    quote.fee_amount = fee.toString();
+    quote.execution_instructions.push(
+      transaction("wrap.near", [call("near_deposit", {}, fee.toString())]),
+      transaction(
+        "wrap.near",
+        [call("ft_transfer", { receiver_id: "wallet.intear.near", amount: fee.toString(), memo: "Trading fee (wallet.intear.near)" })],
+        true,
+      ),
+    );
+    expectUnsafe(quote, /The fees of 9975000000000000000000 are more than the requested fees of at most 5000000000000000000002/);
+  });
+
   test("a quote improvement fee of what the estimate already has", () => {
     expectUnsafe(
       tamper(intearDex, 0, 0, (args) => {
@@ -304,6 +377,15 @@ describe("fees in the next steps", () => {
     expectUnsafe(
       { ...quoteOf("near_to_usdc_exact_in", "RheaDcl"), quote_id: 7 },
       /A quote whose fees are in the next steps has fee transactions/,
+    );
+  });
+
+  test("swapping the whole input, with the fees on top", () => {
+    expectUnsafe(
+      tamper(quote, 0, 1, (args) => {
+        args["amount"] = "1000000000000000000000000";
+      }),
+      /spend 1005000000000000000000000 of the input, more than the 1000000000000000000000000/,
     );
   });
 

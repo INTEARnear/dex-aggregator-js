@@ -1,4 +1,4 @@
-import type { SwapRequest, TokenId } from "./types.js";
+import type { SwapRequest, TokenId } from "./types.ts";
 
 export const WRAP_NEAR = "wrap.near";
 
@@ -8,7 +8,7 @@ export function routeQuery(request: SwapRequest): string {
     token_in: request.tokenIn,
     token_out: request.tokenOut,
   });
-  if ("exactIn" in request.amount) {
+  if (request.amount.exactIn !== undefined) {
     params.set("amount_in", request.amount.exactIn.toString());
   } else {
     params.set("amount_out", request.amount.exactOut.toString());

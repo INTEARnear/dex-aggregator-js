@@ -52,10 +52,11 @@ A signer is `{ signAndSendTransaction(transaction): Promise<txHash> }`. `transac
 
 `validateQuote` (on every quote of a subscription, and before swapping) and `validateNextSteps` (before the next steps are signed) only accept the calls the router makes, with exactly the arguments it passes, and check that:
 
-- the transactions spend at most the exact input, or the quote's worst case of an exact-out swap, counting fees, and wrap at most that much NEAR
-- the swaps give at least the quote's worst case, which is within the requested slippage of its estimate, and exact-out only swaps on Rhea DCL and Intear DEX, whose swaps give exactly the requested output
+- the transactions spend at most the exact input, or the quote's worst case of an exact-out swap, counting fees, also the ones its next steps pay, and wrap at most that much NEAR
+- the fee transactions, the fees paid on Rhea and the referral fees that Intear DEX takes add up to no more than the requested fees
+- the swaps give at least the quote's worst case of exact-in, which is within the requested slippage of its estimate, or the requested output of exact-out, which only swaps on Rhea DCL and Intear DEX, whose swaps give exactly what they're asked for
 - they only call the swap's tokens, wNEAR, Rhea, Rhea DCL and Intear DEX, and only send the trader's tokens to those DEXes and to the requested fee receivers
-- Intear DEX's operations only swap the input for the output, also through other tokens one swap after another, withdraw to the trader, and take the requested referral fees and a quote improvement fee for the requested receiver of no more than the quote's estimate beats
+- Intear DEX's operations only swap the input for the output, also through other tokens one swap after another, withdraw to the trader, pay oracles no more than `MAX_ORACLE_FEES` (1 NEAR, 1 USDT, 1 USDC or 1000 TEAR of the input, out of it or by a swap that buys their fee, and no other asset), and take the requested referral fees and a quote improvement fee for the requested receiver of no more than the quote's estimate beats
 - storage deposits attach no more than the quote's `storage_deposits`, and no more than `MAX_STORAGE_DEPOSITS` (1 NEAR) in all, also in the next steps, for the trader, the DEXes and the fee receivers, and leave no more than `MAX_STORAGE_DEPOSIT_FOR_OTHERS` (0.05 NEAR) on Rhea to each account other than the trader, which it could withdraw
 - next steps don't swap, only pay fees after a swap that went through, no more than the quote's `fee_amount`, and pay the quote improvement fee that the outcome's amounts and the quote's estimate add up to
 - there are at most 20 transactions, as many as the router finds the outcome of
@@ -68,7 +69,7 @@ The quote's estimate and worst case come from the router, so the checks can't te
 
 `RouterConnection` reconnects whenever its connection is lost, waiting twice as long after each failed attempt (250 ms to 10 s by default), and gives up on an attempt after `connectTimeoutMs`. Once it's back, it sends the route request again, and every outcome request that wasn't answered, which the router answers from the quotes it stored by their ID, also after a restart. Its status starts as `connecting`, and `onStatusChange` tells when it changes to `open`, `reconnecting` and `closed`. Right after a restart, the router can answer with no routes until it has loaded the pools.
 
-An outcome request that the router answers with an error is sent again after the same delays, until `outcomeTimeoutMs` (3 minutes by default), when it fails with the router's last error. `swapWithNearConnect` asks `/route/outcome` again the same way, except when the router says the request is wrong. Either way, `onSwapSent` gets the hashes of the swap's transactions first, which tell what the swap did when the router doesn't.
+A route request or an outcome request that the router answers with an error is sent again after the same delays, and an outcome is asked for until `outcomeTimeoutMs` (3 minutes by default), when it fails with the router's last error. When the router says the request is wrong, with an error status of 4xx other than 429, the outcome fails at once, and the subscription ends, with `onError` telling why. `swapWithNearConnect` asks `/route/outcome` again the same way, after its own `retryDelayMs` and until its own `outcomeTimeoutMs`. Either way, `onSwapSent` gets the hashes of the swap's transactions first, which tell what the swap did when the router doesn't. When a signer fails on one of them, `swapWithSigner` throws `SwapInterruptedError`, with the hashes of the ones that executed before it in `txHashes`.
 
 Node's own `WebSocket` (Node 22) errors without closing when it can't connect, which the connection treats as a lost connection too.
 
@@ -76,6 +77,10 @@ Node's own `WebSocket` (Node 22) errors without closing when it can't connect, w
 
 ```bash
 npm install
+npm run check
+npm run lint
 npm test
 npm run build
 ```
+
+Node runs the source as it is, stripping its types (`node src/index.ts`), so `tsconfig.json` only allows TypeScript that can be stripped, and imports name the `.ts` files, which the build makes `.js`.
