@@ -1,0 +1,35 @@
+{
+  "name": "@intear/dex-aggregator",
+  "version": "0.1.0",
+  "description": "Client of the Intear DEX Aggregator that checks its transactions before they're signed",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/INTEARnear/dex-aggregator-js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1",
+    "ws": "^8.23.0"
+  }
+}
