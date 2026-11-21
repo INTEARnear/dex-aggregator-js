@@ -259,7 +259,7 @@ describe("tampered quotes", () => {
   test("transferring NEAR", () => {
     const quote = structuredClone(rhea);
     quote.execution_instructions[0]!.NearTransaction.actions.push({ Transfer: { deposit: "1" } });
-    expectUnsafe(quote, /Routes don't transfer NEAR to anyone/);
+    expectUnsafe(quote, /Routes don't make Transfer actions/);
   });
 
   test("a worst case beyond the slippage", () => {
@@ -368,5 +368,260 @@ describe("next steps of quotes with fee transactions", () => {
     expect(problemsOf(() => validateNextSteps(NEAR_TO_USDC, quote, outcome([swap])))).toContainEqual(
       "wrap.near ft_transfer_call: Next steps don't swap",
     );
+  });
+});
+
+describe("limits of storage deposits", () => {
+  const rheaBalances = REQUESTS["rhea_balances_exact_in"]!;
+  const allowingStorage = (quote: Quote): Quote => ({ ...quote, storage_deposits: "100000000000000000000000000" });
+
+  test("leaving more storage on Rhea to someone else than they need", () => {
+    expectUnsafe(
+      allowingStorage(
+        tamper(quoteOf("rhea_balances_exact_in", "Rhea"), 0, 2, (_, action) => {
+          action.deposit = "60000000000000000000000";
+        }),
+      ),
+      /Leaves 60000000000000000000000 of storage on Rhea to wallet\.intear\.near to withdraw, more than 50000000000000000000000/,
+      rheaBalances,
+    );
+  });
+
+  test("leaving storage on Rhea to someone else over several deposits", () => {
+    const quote = allowingStorage(structuredClone(quoteOf("rhea_balances_exact_in", "Rhea")));
+    const deposit = call(
+      "storage_deposit",
+      { registration_only: false, account_id: "dex-aggregator.intear.near" },
+      "20000000000000000000000",
+      3_000_000_000_000,
+    );
+    quote.execution_instructions[0]!.NearTransaction.actions.push(deposit, deposit);
+    expectUnsafe(quote, /Leaves 64060000000000000000000 of storage on Rhea to dex-aggregator\.intear\.near/, rheaBalances);
+  });
+
+  test("attaching more than the limit to storage deposits in all", () => {
+    const quote = allowingStorage(structuredClone(quoteOf("near_to_usdc_exact_in", "RheaDcl")));
+    quote.execution_instructions.unshift(
+      transaction("dclv2.ref-labs.near", [
+        call("storage_deposit", { registration_only: true }, "2000000000000000000000000", 3_000_000_000_000),
+      ]),
+    );
+    expectUnsafe(quote, /attach 2000000000000000000000000 to storage deposits, more than 1000000000000000000000000 in all/);
+  });
+});
+
+describe("actions of the router", () => {
+  const rheaDcl = quoteOf("near_to_usdc_exact_in", "RheaDcl");
+
+  test("an action of two kinds", () => {
+    const quote = structuredClone(rheaDcl);
+    Object.assign(quote.execution_instructions[0]!.NearTransaction.actions[0]!, {
+      Transfer: { deposit: "100000000000000000000000000" },
+    });
+    expectUnsafe(quote, /wrap\.near near_deposit: Has 2 variants instead of one/);
+  });
+
+  test("a deposit that isn't a decimal amount", () => {
+    expectUnsafe(
+      tamper(rheaDcl, 0, 1, (_, action) => {
+        action.deposit = "0x1";
+      }),
+      /deposit isn't an amount/,
+    );
+  });
+
+  test("gas that isn't a whole amount", () => {
+    const quote = structuredClone(rheaDcl);
+    const action = quote.execution_instructions[0]!.NearTransaction.actions[1]!;
+    if ("FunctionCall" in action) {
+      action.FunctionCall.gas = 1.5;
+    }
+    expectUnsafe(quote, /Its gas of 1\.5 isn't an amount/);
+  });
+
+  test("the most gas the router attaches to a call", () => {
+    const withGas = (gas: number): Quote => {
+      const quote = structuredClone(rheaDcl);
+      const action = quote.execution_instructions[0]!.NearTransaction.actions[1]!;
+      if ("FunctionCall" in action) {
+        action.FunctionCall.gas = gas;
+      }
+      return quote;
+    };
+    expect(problemsOf(() => validateQuote(NEAR_TO_USDC, withGas(900_000_000_000_000)))).toEqual([]);
+    expectUnsafe(withGas(900_000_000_000_001), /Attaches 900000000000001 gas, more than the router attaches to a call/);
+  });
+
+  test("more transactions than the router finds the outcome of", () => {
+    const quote = structuredClone(rheaDcl);
+    const unwrap = transaction("wrap.near", [call("near_withdraw", { amount: "1" })]);
+    quote.execution_instructions.push(...Array.from({ length: 19 }, () => unwrap));
+    expectUnsafe(quote, /Has 21 transactions, more than 20/);
+  });
+
+  test("a quote that isn't shaped like the router's", () => {
+    const { storage_deposits: _, ...malformed } = rheaDcl;
+    expectUnsafe(malformed as Quote, /The quote isn't shaped like the router's quotes: storage_deposits isn't an amount/);
+    expectUnsafe({ ...rheaDcl, execution_instructions: [null] } as unknown as Quote, /The quote isn't shaped like the router's quotes/);
+  });
+
+  test("swapping exact-out on Rhea", () => {
+    const request = REQUESTS["near_to_usdc_exact_out"]!;
+    const quote = tamper(quoteOf("near_to_usdc_exact_out", "RheaDcl"), 0, 1, (args) => {
+      args["receiver_id"] = "v2.ref-finance.near";
+      args["msg"] = JSON.stringify({
+        force: 0,
+        actions: [
+          { pool_id: 1, token_in: "wrap.near", token_out: USDC, amount_in: args["amount"], amount_out: "0", min_amount_out: "0" },
+        ],
+        skip_degen_price_sync: true,
+        skip_unwrap_near: true,
+        referral_id: "wallet.intear.near",
+      });
+    });
+    expectUnsafe(quote, /Swaps exact-out on Rhea, which routes don't/, request);
+  });
+});
+
+describe("chains of swaps on Intear DEX", () => {
+  const USDT = "nep141:usdt.tether-token.near";
+  type Operation = Record<string, unknown>;
+
+  /** The quote's swap as two through USDT, the way the router chains them */
+  function chained(
+    name: "near_to_usdc_exact_in" | "near_to_usdc_exact_out",
+    change: (first: Operation, second: Operation, operations: Operation[]) => void = () => {},
+  ): Quote {
+    return tamper(quoteOf(name, "IntearDex"), 0, 0, (args) => {
+      const operations = (args["operations"] as Operation)["operations"] as Operation[];
+      const index = operations.findIndex((operation) => "SwapSimple" in operation || "SwapAdvanced" in operation);
+      const swap = Object.values(operations[index]!)[0] as Operation;
+      const first: Operation = {
+        dex_id: "slimedragon.near/xyk",
+        message: "",
+        asset_in: swap["asset_in"],
+        asset_out: USDT,
+        amount: swap["amount"],
+        constraint: null,
+        quote_improvement_fee: null,
+      };
+      const second: Operation = {
+        dex_id: "slimedragon.near/xyk",
+        message: "",
+        asset_in: USDT,
+        asset_out: swap["asset_out"],
+        amount: "OutputOfLastIn",
+        constraint: swap["constraint"],
+        quote_improvement_fee: swap["quote_improvement_fee"],
+      };
+      operations.splice(index, 1, { SwapSimple: first }, { SwapSimple: second });
+      change(first, second, operations);
+    });
+  }
+
+  test("swapping through another token", () => {
+    expect(problemsOf(() => validateQuote(NEAR_TO_USDC, chained("near_to_usdc_exact_in")))).toEqual([]);
+  });
+
+  test("a lower minimum output at the end", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_in", (_, second) => {
+        second["constraint"] = "1";
+      }),
+      /guarantee 1 of the output/,
+    );
+  });
+
+  test("constraining a swap before the last one", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_in", (first) => {
+        first["constraint"] = "1";
+      }),
+      /Constrains a swap before the last one of a chain/,
+    );
+  });
+
+  test("swapping something else than the swap before gave", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_in", (_, second) => {
+        second["asset_in"] = "near";
+      }),
+      /Swaps something else than what the swap before it gave/,
+    );
+  });
+
+  test("swapping what a withdrawal gave", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_in", (first, second, operations) => {
+        // The first swap gives the output on its own, then the second swaps it again
+        first["asset_out"] = second["asset_out"];
+        first["constraint"] = second["constraint"];
+        second["asset_in"] = second["asset_out"];
+        const index = operations.findIndex((operation) => operation["SwapSimple"] === first);
+        operations.splice(index + 1, 0, {
+          Withdraw: { asset_id: first["asset_out"], amount: { Full: { at_least: null } }, to: null, rescue_address: null },
+        });
+      }),
+      /Swaps something else than what the swap before it gave/,
+    );
+  });
+
+  test("ending in something else than the output", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_in", (_, second) => {
+        second["asset_out"] = USDT;
+      }),
+      /Swaps to something else than the output/,
+    );
+  });
+
+  test("chaining exact-out swaps", () => {
+    expectUnsafe(
+      chained("near_to_usdc_exact_out"),
+      /only exact-in swaps do/,
+      REQUESTS["near_to_usdc_exact_out"],
+    );
+  });
+});
+
+describe("limits of the next steps", () => {
+  const quote = quoteOf("near_to_usdc_exact_in", "RheaDcl");
+  const outcome = (nextSteps: SwapOutcome["next_steps"]): SwapOutcome => ({
+    charge_fee: true,
+    amount_in: "995000000000000000000000",
+    amount_out: "2846353",
+    balance_changes: [],
+    next_steps: nextSteps,
+    error: null,
+    settled: true,
+  });
+  const rheaStorage = (args: Record<string, unknown>, deposit: string) =>
+    call("storage_deposit", { registration_only: false, ...args }, deposit, 3_000_000_000_000);
+
+  test("leaving storage on Rhea to someone else", () => {
+    const deposits = transaction(
+      "v2.ref-finance.near",
+      Array.from({ length: 2 }, () => rheaStorage({ account_id: "dex-aggregator.intear.near" }, "30000000000000000000000")),
+    );
+    expect(problemsOf(() => validateNextSteps(NEAR_TO_USDC, quote, outcome([deposits])))).toEqual([
+      "v2.ref-finance.near storage_deposit: Leaves 60000000000000000000000 of storage on Rhea to dex-aggregator.intear.near to withdraw, more than 50000000000000000000000",
+    ]);
+  });
+
+  test("attaching more than the limit to storage deposits in all", () => {
+    const deposits = transaction(
+      "v2.ref-finance.near",
+      Array.from({ length: 11 }, () => rheaStorage({}, "100000000000000000000000")),
+    );
+    expect(problemsOf(() => validateNextSteps(NEAR_TO_USDC, quote, outcome([deposits])))).toEqual([
+      "The transactions attach 1100000000000000000000000 to storage deposits, more than 1000000000000000000000000 in all",
+    ]);
+  });
+
+  test("an outcome that isn't shaped like the router's", () => {
+    const { next_steps: _, ...malformed } = outcome([]);
+    expect(problemsOf(() => validateNextSteps(NEAR_TO_USDC, quote, malformed as SwapOutcome))).toEqual([
+      expect.stringMatching(/^The outcome isn't shaped like the router's outcomes/),
+    ]);
   });
 });

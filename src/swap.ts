@@ -1,4 +1,4 @@
-import type { RouterConnection } from "./connection.js";
+import { OUTCOME_TIMEOUT_MS, RETRY_DELAY_MS, retryDelay, type RouterConnection } from "./connection.js";
 import type {
   Action,
   ExecutionInstruction,
@@ -25,8 +25,11 @@ export interface Signer {
 }
 
 export interface SwapProgress {
-  /** The quote's transactions executed, and the router is finding out what they did */
-  onSwapSent?: () => void;
+  /**
+   * The quote's transactions executed, and the router is finding out what they did, asking it
+   * again after its errors until it tells or gives up
+   */
+  onSwapSent?: (txHashes: string[]) => void;
   /** The next steps of the outcome are about to be signed */
   onOutcome?: (outcome: SwapOutcome) => void;
 }
@@ -63,13 +66,9 @@ export async function swapWithNearConnect({
   const results = await wallet.signAndSendTransactions({
     transactions: toTransactions(quote.execution_instructions.filter((i) => !isFee(i))),
   });
-  onSwapSent?.();
-  const outcome = await fetchOutcome(
-    routerUrl,
-    request,
-    quote,
-    results.map((result) => result.transaction_outcome.id),
-  );
+  const txHashes = results.map((result) => result.transaction_outcome.id);
+  onSwapSent?.(txHashes);
+  const outcome = await fetchOutcome(routerUrl, request, quote, txHashes);
   validateNextSteps(request, quote, outcome);
   onOutcome?.(outcome);
   const afterSwap = [
@@ -113,7 +112,7 @@ export async function swapWithSigner({
   for (const transaction of toTransactions(quote.execution_instructions)) {
     txHashes.push(await signer.signAndSendTransaction(transaction));
   }
-  onSwapSent?.();
+  onSwapSent?.(txHashes);
   const outcome = await connection.outcome(quote.quote_id, txHashes);
   validateNextSteps(request, quote, outcome);
   onOutcome?.(outcome);
@@ -151,6 +150,7 @@ export function toTransactions(instructions: ExecutionInstruction[]): Transactio
   }));
 }
 
+/** Asks again after errors, other than of a request that's wrong, until the outcome timeout */
 async function fetchOutcome(
   routerUrl: string,
   request: TraderSwapRequest,
@@ -164,11 +164,26 @@ async function fetchOutcome(
     tx_hashes: txHashes.join(","),
     fee_amount: quote.fee_amount,
   });
-  const response = await fetch(`${routerUrl}/route/outcome?${params}`);
-  if (!response.ok) {
-    throw new Error(
-      `Couldn't find out what the swap did: ${(await response.text()) || `HTTP ${response.status}`}`,
-    );
+  const deadline = Date.now() + OUTCOME_TIMEOUT_MS;
+  for (let failedAttempts = 0; ; failedAttempts += 1) {
+    let error: string;
+    let requestIsWrong = false;
+    try {
+      const response = await fetch(`${routerUrl}/route/outcome?${params}`, {
+        signal: AbortSignal.timeout(Math.max(0, deadline - Date.now())),
+      });
+      if (response.ok) {
+        return (await response.json()) as SwapOutcome;
+      }
+      error = (await response.text()) || `HTTP ${response.status}`;
+      requestIsWrong = response.status >= 400 && response.status < 500 && response.status !== 429;
+    } catch (fetchError) {
+      error = fetchError instanceof Error ? fetchError.message : String(fetchError);
+    }
+    const delay = retryDelay(RETRY_DELAY_MS, failedAttempts);
+    if (requestIsWrong || Date.now() + delay >= deadline) {
+      throw new Error(`Couldn't find out what the swap did: ${error}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
-  return (await response.json()) as SwapOutcome;
 }

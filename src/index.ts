@@ -20,7 +20,8 @@ export {
 } from "./swap.js";
 export type * from "./types.js";
 export {
-  MAX_NEXT_STEP_STORAGE_DEPOSIT,
+  MAX_STORAGE_DEPOSIT_FOR_OTHERS,
+  MAX_STORAGE_DEPOSITS,
   UnsafeTransactionsError,
   validateNextSteps,
   validateQuote,

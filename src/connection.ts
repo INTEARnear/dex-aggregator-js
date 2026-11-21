@@ -3,6 +3,14 @@ import type { Quote, SwapOutcome, SwapRequest } from "./types.js";
 import { UnsafeTransactionsError, validateQuote } from "./validate.js";
 
 export const ROUTER_SUBSCRIBE_URL = "wss://router.intear.tech/route/subscribe";
+export const RETRY_DELAY_MS = { min: 250, max: 10_000 };
+/** The router waits up to 80 seconds for a swap's transactions and balances, so it's a few tries */
+export const OUTCOME_TIMEOUT_MS = 180_000;
+
+/** Twice as long after each attempt that failed */
+export function retryDelay(delayMs: { min: number; max: number }, failedAttempts: number): number {
+  return Math.min(delayMs.max, delayMs.min * 2 ** failedAttempts);
+}
 
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
 
@@ -21,10 +29,16 @@ export interface RouterConnectionOptions {
   url?: string;
   /** The global `WebSocket` if not given */
   WebSocket?: new (url: string) => WebSocketLike;
-  /** Waits twice as long after each attempt that fails, from `min` up to `max` */
+  /**
+   * Waits twice as long after each attempt to connect, or to get an outcome, that fails, from
+   * `min` up to `max`
+   */
   reconnectDelayMs?: { min: number; max: number };
   /** Gives up on an attempt to connect after this long, and tries again */
   connectTimeoutMs?: number;
+  /** Gives up on an outcome after this long, asking again until then when the router errs */
+  outcomeTimeoutMs?: number;
+  /** Of the status changing from `connecting`, which it starts as */
   onStatusChange?: (status: ConnectionStatus) => void;
 }
 
@@ -50,6 +64,11 @@ interface PendingOutcome {
   message: string;
   resolve: (outcome: SwapOutcome) => void;
   reject: (error: Error) => void;
+  failedAttempts: number;
+  /** Of the router's last error, which the outcome is asked for again after */
+  lastError: string | null;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 interface Subscription {
@@ -72,6 +91,7 @@ export class RouterConnection {
   readonly #reconnectDelayMs: { min: number; max: number };
   readonly #onStatusChange: ((status: ConnectionStatus) => void) | undefined;
   readonly #connectTimeoutMs: number;
+  readonly #outcomeTimeoutMs: number;
   #socket: WebSocketLike | null = null;
   #status: ConnectionStatus = "connecting";
   #nextId = 1;
@@ -84,9 +104,10 @@ export class RouterConnection {
     this.#url = options.url ?? ROUTER_SUBSCRIBE_URL;
     this.#WebSocket =
       options.WebSocket ?? (globalThis.WebSocket as unknown as new (url: string) => WebSocketLike);
-    this.#reconnectDelayMs = options.reconnectDelayMs ?? { min: 250, max: 10_000 };
+    this.#reconnectDelayMs = options.reconnectDelayMs ?? RETRY_DELAY_MS;
     this.#onStatusChange = options.onStatusChange;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
+    this.#outcomeTimeoutMs = options.outcomeTimeoutMs ?? OUTCOME_TIMEOUT_MS;
     this.#connect();
   }
 
@@ -99,6 +120,9 @@ export class RouterConnection {
    * Quotes whose transactions aren't safe to sign are left out. Returns what stops it.
    */
   subscribe(request: SwapRequest, options: SubscribeOptions): () => void {
+    if (this.#status === "closed") {
+      throw new Error("The connection to the router is closed");
+    }
     const id = this.#nextId++;
     const message = JSON.stringify({
       id,
@@ -115,7 +139,10 @@ export class RouterConnection {
     };
   }
 
-  /** Of a quote with an ID, once its transactions executed, or only its swap with `"swap"` */
+  /**
+   * Of a quote with an ID, once its transactions executed, or only its swap with `"swap"`. Asks
+   * again after the router's errors, until `outcomeTimeoutMs`.
+   */
   outcome(
     quoteId: number,
     txHashes: string[],
@@ -130,7 +157,23 @@ export class RouterConnection {
       outcome: { quote_id: quoteId, tx_hashes: txHashes, wait_until: waitUntil },
     });
     return new Promise((resolve, reject) => {
-      this.#outcomes.set(id, { message, resolve, reject });
+      const timeout = setTimeout(() => {
+        const pending = this.#outcomes.get(id);
+        if (pending !== undefined) {
+          this.#finishOutcome(id, pending);
+          const lastError = pending.lastError === null ? "" : `: ${pending.lastError}`;
+          reject(new Error(`The router didn't tell the outcome in ${this.#outcomeTimeoutMs} ms${lastError}`));
+        }
+      }, this.#outcomeTimeoutMs);
+      this.#outcomes.set(id, {
+        message,
+        resolve,
+        reject,
+        failedAttempts: 0,
+        lastError: null,
+        retryTimer: null,
+        timeout,
+      });
       this.#send(message);
     });
   }
@@ -143,10 +186,10 @@ export class RouterConnection {
     }
     this.#socket?.close();
     this.#socket = null;
-    for (const pending of this.#outcomes.values()) {
+    for (const [id, pending] of this.#outcomes) {
+      this.#finishOutcome(id, pending);
       pending.reject(new Error("The connection to the router is closed"));
     }
-    this.#outcomes.clear();
   }
 
   /** Sent once the connection is open, if it isn't */
@@ -177,7 +220,10 @@ export class RouterConnection {
         socket.send(this.#subscription.message);
       }
       for (const pending of this.#outcomes.values()) {
-        socket.send(pending.message);
+        // The others are asked for again once they waited after the router's error
+        if (pending.retryTimer === null) {
+          socket.send(pending.message);
+        }
       }
     };
     socket.onmessage = (event) => this.#receive(String(event.data));
@@ -188,10 +234,7 @@ export class RouterConnection {
 
   #reconnect(): void {
     this.#setStatus("reconnecting");
-    const delay = Math.min(
-      this.#reconnectDelayMs.max,
-      this.#reconnectDelayMs.min * 2 ** this.#failedAttempts,
-    );
+    const delay = retryDelay(this.#reconnectDelayMs, this.#failedAttempts);
     this.#failedAttempts += 1;
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
@@ -200,31 +243,48 @@ export class RouterConnection {
   }
 
   #receive(data: string): void {
-    const message = JSON.parse(data) as {
-      id: number;
-      routes?: Quote[];
-      outcome?: SwapOutcome;
-      error?: string;
-    };
-    const pending = this.#outcomes.get(message.id);
-    if (pending !== undefined) {
-      this.#outcomes.delete(message.id);
-      if (message.outcome !== undefined) {
-        pending.resolve(message.outcome);
-      } else {
-        pending.reject(new Error(message.error ?? "The router answered without an outcome"));
+    let message: { id?: unknown; routes?: unknown; outcome?: SwapOutcome; error?: string };
+    try {
+      message = JSON.parse(data) as typeof message;
+      if (typeof message !== "object" || message === null) {
+        throw new Error("Isn't an object");
       }
+    } catch {
+      this.#subscription?.options.onError?.(new Error(`The router sent something else than a message: ${data}`));
+      return;
+    }
+    const pending = typeof message.id === "number" ? this.#outcomes.get(message.id) : undefined;
+    if (pending !== undefined) {
+      if (message.outcome !== undefined) {
+        this.#finishOutcome(message.id as number, pending);
+        pending.resolve(message.outcome);
+        return;
+      }
+      pending.lastError = message.error ?? "The router answered without an outcome";
+      pending.retryTimer = setTimeout(() => {
+        pending.retryTimer = null;
+        this.#send(pending.message);
+      }, retryDelay(this.#reconnectDelayMs, pending.failedAttempts));
+      pending.failedAttempts += 1;
       return;
     }
     const subscription = this.#subscription;
     // Of an earlier route request
-    if (subscription?.id !== message.id) {
+    if (subscription === null || subscription.id !== message.id) {
       return;
     }
-    if (message.routes !== undefined) {
-      subscription.options.onQuotes(checkQuotes(subscription.request, message.routes));
+    if (Array.isArray(message.routes)) {
+      subscription.options.onQuotes(checkQuotes(subscription.request, message.routes as Quote[]));
     } else {
       subscription.options.onError?.(new Error(message.error ?? "The router answered without routes"));
+    }
+  }
+
+  #finishOutcome(id: number, pending: PendingOutcome): void {
+    this.#outcomes.delete(id);
+    clearTimeout(pending.timeout);
+    if (pending.retryTimer !== null) {
+      clearTimeout(pending.retryTimer);
     }
   }
 

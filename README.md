@@ -21,16 +21,27 @@ const request: SwapRequest = {
   fees: { "app.near": 0.005 },
   quoteImprovementReceiver: "app.near",
 };
+// The router estimates the price, so the least to take for 1 NEAR comes from a price you trust
+const leastAmountOut = 2_500_000n; // 2.5 USDC
 const connection = new RouterConnection();
 const stop = connection.subscribe(request, {
   feesInNextSteps: true,
-  onQuotes: async ({ quotes, rejected }) => {
+  onQuotes: ({ quotes, rejected }) => {
     // `rejected` has the quotes whose transactions aren't safe to sign, and why
     const [best] = quotes;
-    if (best !== undefined) {
-      stop();
-      const { outcome } = await swapWithSigner({ signer, connection, request, quote: best });
+    if (best === undefined || BigInt(best.worst_case_amount.amount_out!) < leastAmountOut) {
+      return;
     }
+    stop();
+    swapWithSigner({
+      signer,
+      connection,
+      request,
+      quote: best,
+      onSwapSent: (txHashes) => console.log("Swapped in", txHashes),
+    })
+      .then(({ outcome, nextStepsError }) => console.log(outcome, nextStepsError))
+      .catch((error) => console.error("The swap failed", error));
   },
 });
 ```
@@ -42,17 +53,22 @@ A signer is `{ signAndSendTransaction(transaction): Promise<txHash> }`. `transac
 `validateQuote` (on every quote of a subscription, and before swapping) and `validateNextSteps` (before the next steps are signed) only accept the calls the router makes, with exactly the arguments it passes, and check that:
 
 - the transactions spend at most the exact input, or the quote's worst case of an exact-out swap, counting fees, and wrap at most that much NEAR
-- the swaps give at least the quote's worst case, which is within the requested slippage of its estimate
+- the swaps give at least the quote's worst case, which is within the requested slippage of its estimate, and exact-out only swaps on Rhea DCL and Intear DEX, whose swaps give exactly the requested output
 - they only call the swap's tokens, wNEAR, Rhea, Rhea DCL and Intear DEX, and only send the trader's tokens to those DEXes and to the requested fee receivers
-- Intear DEX's operations only swap the input for the output, withdraw to the trader, and take the requested referral fees and a quote improvement fee for the requested receiver of no more than the quote's estimate beats
-- storage deposits attach no more than the quote's `storage_deposits`, for the trader, the DEXes and the fee receivers
+- Intear DEX's operations only swap the input for the output, also through other tokens one swap after another, withdraw to the trader, and take the requested referral fees and a quote improvement fee for the requested receiver of no more than the quote's estimate beats
+- storage deposits attach no more than the quote's `storage_deposits`, and no more than `MAX_STORAGE_DEPOSITS` (1 NEAR) in all, also in the next steps, for the trader, the DEXes and the fee receivers, and leave no more than `MAX_STORAGE_DEPOSIT_FOR_OTHERS` (0.05 NEAR) on Rhea to each account other than the trader, which it could withdraw
 - next steps don't swap, only pay fees after a swap that went through, no more than the quote's `fee_amount`, and pay the quote improvement fee that the outcome's amounts and the quote's estimate add up to
+- there are at most 20 transactions, as many as the router finds the outcome of
 
-A check that fails throws `UnsafeTransactionsError`, with every problem in `problems`.
+A check that fails throws `UnsafeTransactionsError`, with every problem in `problems`, also when the router's quote or outcome isn't shaped like its quotes and outcomes are.
+
+The quote's estimate and worst case come from the router, so the checks can't tell a bad price: compare them with a price you trust before swapping.
 
 ## Reconnecting
 
-`RouterConnection` reconnects whenever its connection is lost, waiting twice as long after each failed attempt (250 ms to 10 s by default), and gives up on an attempt after `connectTimeoutMs`. Once it's back, it sends the route request again, and every outcome request that wasn't answered, which the router answers from the quotes it stored by their ID, also after a restart. `onStatusChange` tells `connecting`, `open`, `reconnecting` and `closed`. Right after a restart, the router can answer with no routes until it has loaded the pools.
+`RouterConnection` reconnects whenever its connection is lost, waiting twice as long after each failed attempt (250 ms to 10 s by default), and gives up on an attempt after `connectTimeoutMs`. Once it's back, it sends the route request again, and every outcome request that wasn't answered, which the router answers from the quotes it stored by their ID, also after a restart. Its status starts as `connecting`, and `onStatusChange` tells when it changes to `open`, `reconnecting` and `closed`. Right after a restart, the router can answer with no routes until it has loaded the pools.
+
+An outcome request that the router answers with an error is sent again after the same delays, until `outcomeTimeoutMs` (3 minutes by default), when it fails with the router's last error. `swapWithNearConnect` asks `/route/outcome` again the same way, except when the router says the request is wrong. Either way, `onSwapSent` gets the hashes of the swap's transactions first, which tell what the swap did when the router doesn't.
 
 Node's own `WebSocket` (Node 22) errors without closing when it can't connect, which the connection treats as a lost connection too.
 

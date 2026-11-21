@@ -14,16 +14,24 @@ const INTEAR_DEX = "dex.intear.near";
 /** Takes a share of every referral fee */
 const AGGREGATOR_FEE_RECEIVER = "dex-aggregator.intear.near";
 const FULL_FEE_FRACTION = 1_000_000n;
-const MAX_GAS = 300_000_000_000_000n;
+/** The most that the router attaches to a call, with room in its transaction for the others */
+const MAX_GAS = 900_000_000_000_000n;
 /** Each path of a split route rounds its own worst case */
 const WORST_CASE_ROUNDING = 32n;
 const TRADING_FEE_MEMO_PREFIX = "Trading fee (";
 const QUOTE_IMPROVEMENT_FEE_MEMO = "Quote improvement fee";
+/** As many as the router finds the outcome of */
+const MAX_TRANSACTIONS = 20;
 /**
- * The most a next step attaches to a storage deposit. Next steps register the trader, and the
- * receiver of the quote improvement fee, which a quote has no figure of.
+ * The most that the storage deposits of a quote attach in all, and again of its next steps, which
+ * have no figure of them. A trader new to Rhea DCL deposits its minimum of 0.5 NEAR.
  */
-export const MAX_NEXT_STEP_STORAGE_DEPOSIT = 100_000_000_000_000_000_000_000n; // 0.1 NEAR
+export const MAX_STORAGE_DEPOSITS = 1_000_000_000_000_000_000_000_000n; // 1 NEAR
+/**
+ * The most that Rhea's storage deposits leave to each account other than the trader, which can
+ * withdraw them. A fee receiver new to Rhea takes 0.0112 NEAR.
+ */
+export const MAX_STORAGE_DEPOSIT_FOR_OTHERS = 50_000_000_000_000_000_000_000n; // 0.05 NEAR
 
 /** What makes the router's transactions unsafe to sign, one problem each */
 export class UnsafeTransactionsError extends Error {
@@ -37,21 +45,27 @@ export class UnsafeTransactionsError extends Error {
  * Checks that the quote's transactions only do what the request asks: spend at most the input
  * the trader allows (the exact input, or the quote's worst case of exact-out), get at least the
  * quote's worst case of the output, call only the tokens of the swap and the DEXes the router
- * uses, attach no more to storage deposits than the quote says, and pay fees only to the
- * requested receivers, no more than requested.
+ * uses, attach no more to storage deposits than the quote says and the limits allow, and pay fees
+ * only to the requested receivers, no more than requested. A quote that isn't shaped like the
+ * router's is unsafe too.
  */
 export function validateQuote(request: SwapRequest, quote: Quote): void {
   const checker = new TransactionChecker(request, quote, "quote");
-  const feesInNextSteps = quote.quote_id !== undefined;
-  checker.amounts();
-  for (const instruction of quote.execution_instructions) {
-    const isFeeTransaction = instruction.NearTransaction.is_fee_transaction === true;
-    if (isFeeTransaction && feesInNextSteps) {
-      checker.problem("A quote whose fees are in the next steps has fee transactions");
+  try {
+    const feesInNextSteps = quote.quote_id !== undefined;
+    checker.amounts();
+    checker.transactionCount(quote.execution_instructions);
+    for (const instruction of quote.execution_instructions) {
+      const isFeeTransaction = instruction.NearTransaction.is_fee_transaction === true;
+      if (isFeeTransaction && feesInNextSteps) {
+        checker.problem("A quote whose fees are in the next steps has fee transactions");
+      }
+      checker.instruction(instruction, isFeeTransaction);
     }
-    checker.instruction(instruction, isFeeTransaction);
+    checker.quoteTotals(feesInNextSteps);
+  } catch (error) {
+    checker.problem(`The quote isn't shaped like the router's quotes: ${message(error)}`);
   }
-  checker.quoteTotals(feesInNextSteps);
   checker.throwProblems();
 }
 
@@ -66,16 +80,21 @@ export function validateNextSteps(
   outcome: SwapOutcome,
 ): void {
   const checker = new TransactionChecker(request, quote, "nextSteps");
-  const feesDue = quote.quote_id !== undefined && outcome.charge_fee;
-  for (const instruction of outcome.next_steps) {
-    const isFeeTransaction = instruction.NearTransaction.is_fee_transaction === true;
-    if (isFeeTransaction && !feesDue) {
-      checker.problem("The next steps pay fees, which are only due after a swap that went through");
-      continue;
+  try {
+    const feesDue = quote.quote_id !== undefined && outcome.charge_fee;
+    checker.transactionCount(outcome.next_steps);
+    for (const instruction of outcome.next_steps) {
+      const isFeeTransaction = instruction.NearTransaction.is_fee_transaction === true;
+      if (isFeeTransaction && !feesDue) {
+        checker.problem("The next steps pay fees, which are only due after a swap that went through");
+        continue;
+      }
+      checker.instruction(instruction, isFeeTransaction);
     }
-    checker.instruction(instruction, isFeeTransaction);
+    checker.nextStepTotals(outcome);
+  } catch (error) {
+    checker.problem(`The outcome isn't shaped like the router's outcomes: ${message(error)}`);
   }
-  checker.nextStepTotals(outcome);
   checker.throwProblems();
 }
 
@@ -92,8 +111,6 @@ class TransactionChecker {
   readonly #feeReceivers: Set<string>;
   /** Of the requested fees, in millionths of the input */
   readonly #requestedFee: bigint;
-  /** What the trader allows the swap to take */
-  readonly #maxInput: bigint;
   /** Of the input, sent to DEXes and to fee receivers */
   #spent = 0n;
   /** Paid out of the wallet balance of the input */
@@ -101,6 +118,8 @@ class TransactionChecker {
   /** Paid out of the balance of the input on Rhea */
   #rheaFees = 0n;
   #storageDeposits = 0n;
+  /** Of accounts other than the trader, which they can withdraw */
+  readonly #othersRheaStorage = new Map<string, bigint>();
   /** Native NEAR made into wNEAR */
   #wrapped = 0n;
   /** What the swaps give at least, of exact-in */
@@ -125,10 +144,6 @@ class TransactionChecker {
       (total, fraction) => total + BigInt(Math.round(fraction * Number(FULL_FEE_FRACTION))),
       0n,
     );
-    this.#maxInput =
-      "exactIn" in request.amount
-        ? request.amount.exactIn
-        : amountOf(quote.worst_case_amount, "amount_in");
   }
 
   problem(problem: string): void {
@@ -176,6 +191,12 @@ class TransactionChecker {
     }
   }
 
+  transactionCount(instructions: ExecutionInstruction[]): void {
+    if (instructions.length > MAX_TRANSACTIONS) {
+      this.problem(`Has ${instructions.length} transactions, more than ${MAX_TRANSACTIONS}`);
+    }
+  }
+
   instruction(instruction: ExecutionInstruction, isFeeTransaction: boolean): void {
     const { receiver_id, actions } = instruction.NearTransaction;
     for (const action of actions) {
@@ -189,28 +210,34 @@ class TransactionChecker {
   }
 
   quoteTotals(feesInNextSteps: boolean): void {
-    if (this.#spent > this.#maxInput) {
+    // What the trader allows the swap to take
+    const maxInput =
+      "exactIn" in this.request.amount
+        ? this.request.amount.exactIn
+        : amountOf(this.quote.worst_case_amount, "amount_in");
+    if (this.#spent > maxInput) {
       this.problem(
-        `The transactions spend ${this.#spent} of the input, more than the ${this.#maxInput} the trader allows`,
+        `The transactions spend ${this.#spent} of the input, more than the ${maxInput} the trader allows`,
       );
     }
-    const storageDeposits = BigInt(this.quote.storage_deposits);
+    const storageDeposits = bigint(this.quote.storage_deposits, "storage_deposits");
     if (this.#storageDeposits > storageDeposits) {
       this.problem(
         `The transactions attach ${this.#storageDeposits} to storage deposits, more than the quote's ${storageDeposits}`,
       );
     }
-    if (this.#wrapped > 0n && !(this.#tokenIn.contract === WRAP_NEAR && this.#wrapped <= this.#maxInput)) {
+    this.#storageDepositsWithinLimit();
+    if (this.#wrapped > 0n && !(this.#tokenIn.contract === WRAP_NEAR && this.#wrapped <= maxInput)) {
       this.problem(`The transactions wrap ${this.#wrapped} NEAR, which isn't the input`);
     }
-    const feeAmount = BigInt(this.quote.fee_amount);
+    const feeAmount = bigint(this.quote.fee_amount, "fee_amount");
     if (!feesInNextSteps && this.#walletFees !== feeAmount) {
       this.problem(
         `The fee transactions pay ${this.#walletFees}, not the quote's fee amount of ${feeAmount}`,
       );
     }
     const maxFees =
-      (this.#maxInput * this.#requestedFee) / FULL_FEE_FRACTION + BigInt(this.#feeReceivers.size);
+      (maxInput * this.#requestedFee) / FULL_FEE_FRACTION + BigInt(this.#feeReceivers.size);
     const fees = feeAmount + this.#rheaFees;
     if (fees > maxFees) {
       this.problem(`The fees of ${fees} are more than the requested fees of at most ${maxFees}`);
@@ -229,11 +256,12 @@ class TransactionChecker {
   }
 
   nextStepTotals(outcome: SwapOutcome): void {
-    const feeAmount = BigInt(this.quote.fee_amount);
+    this.#storageDepositsWithinLimit();
+    const feeAmount = bigint(this.quote.fee_amount, "fee_amount");
     if (this.#walletFees > feeAmount) {
       this.problem(`The next steps pay ${this.#walletFees} of fees, more than the quote's ${feeAmount}`);
     }
-    const quoteImprovementFee = BigInt(outcome.quote_improvement_fee ?? "0");
+    const quoteImprovementFee = bigint(outcome.quote_improvement_fee ?? "0", "quote_improvement_fee");
     if (this.#quoteImprovementFee !== quoteImprovementFee) {
       this.problem(
         `The next steps pay a quote improvement fee of ${this.#quoteImprovementFee}, not the outcome's ${quoteImprovementFee}`,
@@ -241,8 +269,8 @@ class TransactionChecker {
     }
     if (quoteImprovementFee > 0n) {
       const beatBy = this.#exactIn
-        ? BigInt(outcome.amount_out) - this.#estimated
-        : this.#estimated - feeAmount - BigInt(outcome.amount_in);
+        ? bigint(outcome.amount_out, "amount_out") - this.#estimated
+        : this.#estimated - feeAmount - bigint(outcome.amount_in, "amount_in");
       if (quoteImprovementFee !== beatBy) {
         this.problem(
           `The quote improvement fee of ${quoteImprovementFee} isn't the ${beatBy} that the swap beat the quote by`,
@@ -252,15 +280,20 @@ class TransactionChecker {
   }
 
   #action(receiverId: string, action: RouterAction, isFeeTransaction: boolean): void {
+    // An action of two kinds would be checked as one of them and signed as the other
+    const [kind] = singleEntry(action);
     if (!("FunctionCall" in action)) {
-      throw new Error("Routes don't transfer NEAR to anyone");
+      throw new Error(`Routes don't make ${kind} actions`);
     }
     const { method_name: method, args: encodedArgs, gas, deposit } = action.FunctionCall;
+    if (!Number.isSafeInteger(gas) || gas < 0) {
+      throw new Error(`Its gas of ${gas} isn't an amount`);
+    }
     if (BigInt(gas) > MAX_GAS) {
-      throw new Error(`Attaches ${gas} gas, more than a call can have`);
+      throw new Error(`Attaches ${gas} gas, more than the router attaches to a call`);
     }
     const args = decodeArgs(encodedArgs);
-    const attached = BigInt(deposit);
+    const attached = bigint(deposit, "deposit");
     // In next steps, a fee transaction also moves the quote improvement fee into the wallet first
     if (
       this.phase === "quote" &&
@@ -293,7 +326,7 @@ class TransactionChecker {
         if (args["account_id"] !== undefined) {
           this.#storageAccount(args["account_id"]);
         }
-        this.#storageDeposit(attached);
+        this.#storageDeposits += attached;
         return;
       }
       case "near_deposit": {
@@ -386,10 +419,22 @@ class TransactionChecker {
         if (args["registration_only"] !== false) {
           throw new Error("Rhea's storage is deposited whole");
         }
-        if (args["account_id"] !== undefined) {
-          this.#storageAccount(args["account_id"]);
+        this.#storageDeposits += attached;
+        if (args["account_id"] === undefined) {
+          return;
         }
-        this.#storageDeposit(attached);
+        const accountId = string(args["account_id"], "account_id");
+        this.#storageAccount(accountId);
+        if (accountId === this.request.traderAccountId) {
+          return;
+        }
+        const leftToAccount = (this.#othersRheaStorage.get(accountId) ?? 0n) + attached;
+        if (leftToAccount > MAX_STORAGE_DEPOSIT_FOR_OTHERS) {
+          throw new Error(
+            `Leaves ${leftToAccount} of storage on Rhea to ${accountId} to withdraw, more than ${MAX_STORAGE_DEPOSIT_FOR_OTHERS}`,
+          );
+        }
+        this.#othersRheaStorage.set(accountId, leftToAccount);
         return;
       }
       case "swap": {
@@ -433,6 +478,10 @@ class TransactionChecker {
 
   /** The input that the actions swap, adding up the least output they give */
   #rheaActions(actions: unknown): bigint {
+    // Rhea's actions only guarantee an output of exact-in, which routes only swap there
+    if (!this.#exactIn) {
+      throw new Error("Swaps exact-out on Rhea, which routes don't");
+    }
     if (!Array.isArray(actions) || actions.length === 0) {
       throw new Error("Has no swap actions");
     }
@@ -466,7 +515,7 @@ class TransactionChecker {
       throw new Error("Isn't a call that routes make to Rhea DCL");
     }
     onlyKeys(args, ["registration_only"]);
-    this.#storageDeposit(attached);
+    this.#storageDeposits += attached;
   }
 
   #rheaDclSwap(message: Json): void {
@@ -492,7 +541,7 @@ class TransactionChecker {
     switch (method) {
       case "storage_deposit": {
         onlyKeys(args, []);
-        this.#storageDeposit(attached);
+        this.#storageDeposits += attached;
         return;
       }
       case "register_assets": {
@@ -545,11 +594,14 @@ class TransactionChecker {
     // A fee discount only lowers the swaps' pool fees, and the engine checks its signature
     onlyKeys(args, ["operations", "referrer", "referral_fees", "fee_discount"]);
     this.#engineReferralFees(args["referral_fees"]);
-    if (!Array.isArray(args["operations"])) {
+    const operations = args["operations"];
+    if (!Array.isArray(operations)) {
       throw new Error("Has no operations");
     }
     let taken = 0n;
-    for (const entry of args["operations"]) {
+    let previousSwap: Json | undefined;
+    operations.forEach((entry: unknown, index) => {
+      const next: unknown = operations[index + 1];
       const [kind, value] = singleEntry(object(entry, "operation"));
       const operation = object(value, kind);
       switch (kind) {
@@ -577,12 +629,12 @@ class TransactionChecker {
         }
         case "SwapSimple": {
           onlyKeys(operation, ["dex_id", "message", "asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee"]);
-          taken += this.#engineSwap(operation);
+          taken += this.#engineSwap(operation, previousSwap, next);
           break;
         }
         case "SwapAdvanced": {
           onlyKeys(operation, ["asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee", "options", "mode"]);
-          taken += this.#engineSwap(operation);
+          taken += this.#engineSwap(operation, previousSwap, next);
           break;
         }
         case "Withdraw": {
@@ -596,33 +648,59 @@ class TransactionChecker {
         default:
           throw new Error(`Runs ${kind} on Intear DEX, which routes don't`);
       }
-    }
+      previousSwap = kind === "SwapSimple" || kind === "SwapAdvanced" ? operation : undefined;
+    });
     return taken;
   }
 
-  /** What the swap takes at most */
-  #engineSwap(operation: Json): bigint {
-    if (!this.#inputAssets.includes(operation["asset_in"] as string)) {
-      throw new Error("Swaps something else than the input");
+  /**
+   * What the swap takes at most of the input. Exact-in swaps can be chained: each swap of
+   * `OutputOfLastIn` swaps what the one before it gave, and only the last one is constrained.
+   */
+  #engineSwap(operation: Json, previousSwap: Json | undefined, next: unknown): bigint {
+    let taken = 0n;
+    if (operation["amount"] === "OutputOfLastIn") {
+      if (!this.#exactIn) {
+        throw new Error("Swaps what the swap before it gave, which only exact-in swaps do");
+      }
+      if (previousSwap === undefined || string(operation["asset_in"], "asset_in") !== previousSwap["asset_out"]) {
+        throw new Error("Swaps something else than what the swap before it gave");
+      }
+    } else {
+      if (!this.#inputAssets.includes(operation["asset_in"] as string)) {
+        throw new Error("Swaps something else than the input");
+      }
+      const amount = object(object(operation["amount"], "amount")["Amount"], "Amount");
+      const [kind, value] = singleEntry(amount);
+      if (kind === "ExactIn" && "exactIn" in this.request.amount) {
+        taken = bigint(value, "ExactIn");
+      } else if (kind === "ExactOut" && "exactOut" in this.request.amount) {
+        if (bigint(value, "ExactOut") !== this.request.amount.exactOut) {
+          throw new Error("Swaps for another amount than the requested output");
+        }
+      } else {
+        throw new Error(`${kind} isn't the swap the request asks for`);
+      }
+    }
+    const nextOperation = next as Json | undefined;
+    const nextSwap = (nextOperation?.["SwapSimple"] ?? nextOperation?.["SwapAdvanced"]) as Json | undefined;
+    if (nextSwap?.["amount"] === "OutputOfLastIn") {
+      if (operation["constraint"] !== null || operation["quote_improvement_fee"] !== null) {
+        throw new Error("Constrains a swap before the last one of a chain, which routes don't");
+      }
+      return taken;
     }
     if (!this.#outputAssets.includes(operation["asset_out"] as string)) {
       throw new Error("Swaps to something else than the output");
     }
-    const amount = object(object(operation["amount"], "amount")["Amount"], "Amount");
-    const [kind, value] = singleEntry(amount);
     const constraint = bigint(operation["constraint"], "constraint");
     this.#engineQuoteImprovementFee(operation["quote_improvement_fee"]);
-    if (kind === "ExactIn" && "exactIn" in this.request.amount) {
-      this.#guaranteedOutput += constraint;
-      return bigint(value, "ExactIn");
-    }
-    if (kind === "ExactOut" && "exactOut" in this.request.amount) {
-      if (bigint(value, "ExactOut") !== this.request.amount.exactOut) {
-        throw new Error("Swaps for another amount than the requested output");
-      }
+    if (!this.#exactIn) {
+      // The most that an exact-out swap takes
       return constraint;
     }
-    throw new Error(`${kind} isn't the swap the request asks for`);
+    this.#guaranteedOutput += constraint;
+    return taken;
   }
 
   #engineQuoteImprovementFee(fee: unknown): void {
@@ -672,11 +750,12 @@ class TransactionChecker {
     this.#swaps += 1;
   }
 
-  #storageDeposit(attached: bigint): void {
-    if (this.phase === "nextSteps" && attached > MAX_NEXT_STEP_STORAGE_DEPOSIT) {
-      throw new Error(`Attaches ${attached} to a storage deposit, more than ${MAX_NEXT_STEP_STORAGE_DEPOSIT}`);
+  #storageDepositsWithinLimit(): void {
+    if (this.#storageDeposits > MAX_STORAGE_DEPOSITS) {
+      this.problem(
+        `The transactions attach ${this.#storageDeposits} to storage deposits, more than ${MAX_STORAGE_DEPOSITS} in all`,
+      );
     }
-    this.#storageDeposits += attached;
   }
 
   #storageAccount(accountId: unknown): void {
@@ -713,11 +792,7 @@ class TransactionChecker {
 }
 
 function amountOf(amount: RouterAmount, kind: "amount_in" | "amount_out"): bigint {
-  const value = amount[kind];
-  if (value === undefined) {
-    throw new Error(`Has no ${kind}`);
-  }
-  return BigInt(value);
+  return bigint(amount[kind], kind);
 }
 
 function decodeArgs(base64: string): Json {

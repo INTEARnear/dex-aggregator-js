@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { swapWithNearConnect, type NearConnectWallet } from "../src/swap.js";
+import type { RouterConnection } from "../src/connection.js";
+import { swapWithNearConnect, swapWithSigner, type NearConnectWallet } from "../src/swap.js";
 import type { SwapOutcome, Transaction } from "../src/types.js";
 import { UnsafeTransactionsError } from "../src/validate.js";
-import { call, quoteOf, transaction } from "./helpers.js";
+import { call, quoteOf, transaction, withFeesInNextSteps } from "./helpers.js";
 import { REQUESTS } from "./requests.js";
 
 const request = REQUESTS["near_to_usdc_exact_in"]!;
@@ -106,4 +107,64 @@ describe("swapping with near-connect", () => {
       nextStepsError: rejection,
     });
   });
+
+  test("tells the hashes of the swap's transactions", async () => {
+    answerOutcome(swapped);
+    const sent: string[][] = [];
+    await swapWithNearConnect({
+      wallet: recordingWallet(),
+      request,
+      quote,
+      routerUrl: "https://router.test",
+      onSwapSent: (txHashes) => sent.push(txHashes),
+    });
+    expect(sent).toEqual([Array.from({ length: swapTransactions }, (_, index) => `tx1-${index}`)]);
+  });
+
+  test("asks for the outcome again after the router's errors", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Failed to get the transaction", { status: 502 }))
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(Response.json(swapped));
+    vi.stubGlobal("fetch", fetch);
+    const result = await swapWithNearConnect({ wallet: recordingWallet(), request, quote, routerUrl: "https://router.test" });
+    expect(result.outcome).toEqual(swapped);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  test("doesn't ask again for the outcome of a request that's wrong", async () => {
+    const fetch = vi.fn(async () => new Response("Transaction tx1-0 is signed by other.near, not intear.near", { status: 400 }));
+    vi.stubGlobal("fetch", fetch);
+    const wallet = recordingWallet();
+    await expect(swapWithNearConnect({ wallet, request, quote, routerUrl: "https://router.test" })).rejects.toThrow(
+      "Couldn't find out what the swap did: Transaction tx1-0 is signed by other.near, not intear.near",
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(wallet.batches).toHaveLength(1);
+  });
+});
+
+test("swapping with a signer tells the hashes of the swap's transactions", async () => {
+  const quote = withFeesInNextSteps(quoteOf("near_to_usdc_exact_in", "RheaDcl"));
+  const signed: Transaction[] = [];
+  const signer = {
+    signAndSendTransaction: async (transaction: Transaction) => {
+      signed.push(transaction);
+      return `tx${signed.length}`;
+    },
+  };
+  const asked: [number, string[]][] = [];
+  const connection = {
+    outcome: async (quoteId: number, txHashes: string[]) => {
+      asked.push([quoteId, txHashes]);
+      return swapped;
+    },
+  } as unknown as RouterConnection;
+  const sent: string[][] = [];
+  const result = await swapWithSigner({ signer, connection, request, quote, onSwapSent: (txHashes) => sent.push(txHashes) });
+  const txHashes = quote.execution_instructions.map((_, index) => `tx${index + 1}`);
+  expect(sent).toEqual([txHashes]);
+  expect(asked).toEqual([[quote.quote_id, txHashes]]);
+  expect(result).toEqual({ outcome: swapped, nextStepsError: null });
 });
