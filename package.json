@@ -6,7 +6,10 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/INTEARnear/dex-aggregator-js"
+    "url": "git+https://github.com/INTEARnear/dex-aggregator-js.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
