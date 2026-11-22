@@ -60,8 +60,9 @@ export interface SwapResult {
 }
 
 /**
- * Swaps with a wallet that asks the trader: the quote's transactions in one approval, then, after
- * the swap, its fee transactions if it went through, and the next steps, in another
+ * Swaps with a wallet that asks the trader: the quote's transactions, its fee transactions
+ * included, in one approval, as the wallet doesn't send the fee transactions of a swap that it sees
+ * failed, then the next steps, if there are any, in another
  */
 export async function swapWithNearConnect({
   wallet,
@@ -86,24 +87,22 @@ export async function swapWithNearConnect({
     throw new Error("A quote with its fees in the next steps is for swapWithSigner");
   }
   validateQuote(request, quote);
-  const isFee = (instruction: ExecutionInstruction) =>
-    instruction.NearTransaction.is_fee_transaction === true;
   const results = await wallet.signAndSendTransactions({
-    transactions: toTransactions(quote.execution_instructions.filter((i) => !isFee(i))),
+    transactions: toTransactions(quote.execution_instructions),
   });
-  const txHashes = results.map((result) => result.transaction_outcome.id);
+  // The fee transactions come last, and the outcome is of the ones before them
+  const swapTransactions = quote.execution_instructions.filter(
+    (instruction) => instruction.NearTransaction.is_fee_transaction !== true,
+  ).length;
+  const txHashes = results.slice(0, swapTransactions).map((result) => result.transaction_outcome.id);
   onSwapSent?.(txHashes);
   const outcome = await fetchOutcome(routerUrl, request, quote, txHashes, retryDelayMs, outcomeTimeoutMs);
   validateNextSteps(request, quote, outcome);
   onOutcome?.(outcome);
-  const afterSwap = [
-    ...(outcome.charge_fee ? quote.execution_instructions.filter(isFee) : []),
-    ...outcome.next_steps,
-  ];
   let nextStepsError: unknown = null;
-  if (afterSwap.length > 0) {
+  if (outcome.next_steps.length > 0) {
     try {
-      await wallet.signAndSendTransactions({ transactions: toTransactions(afterSwap) });
+      await wallet.signAndSendTransactions({ transactions: toTransactions(outcome.next_steps) });
     } catch (error) {
       nextStepsError = error;
     }

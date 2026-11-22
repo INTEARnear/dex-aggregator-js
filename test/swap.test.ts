@@ -43,6 +43,14 @@ const swapped: SwapOutcome = {
   error: null,
   settled: true,
 };
+const failed: SwapOutcome = {
+  ...swapped,
+  charge_fee: false,
+  error: "Slippage",
+  amount_in: "0",
+  amount_out: "0",
+  next_steps: [unwrap],
+};
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -53,13 +61,13 @@ describe("swapping with near-connect", () => {
   const swapTransactions = quote.execution_instructions.filter((_, index) => !isFee(index)).length;
   const feeTransactions = quote.execution_instructions.length - swapTransactions;
 
-  test("signs the fee transactions only after the swap went through", async () => {
+  test("signs the fee transactions with the swap, in one approval", async () => {
     expect(feeTransactions).toBeGreaterThan(0);
     const fetch = answerOutcome(swapped);
     const wallet = recordingWallet();
     const result = await swapWithNearConnect({ wallet, request, quote, routerUrl: "https://router.test" });
     expect(result).toEqual({ outcome: swapped, nextStepsError: null });
-    expect(wallet.batches.map((batch) => batch.length)).toEqual([swapTransactions, feeTransactions]);
+    expect(wallet.batches.map((batch) => batch.length)).toEqual([quote.execution_instructions.length]);
     const url = new URL(fetch.mock.calls[0]![0] as string);
     expect(url.pathname).toBe("/route/outcome");
     expect(url.searchParams.get("tx_hashes")).toBe(
@@ -68,13 +76,27 @@ describe("swapping with near-connect", () => {
     expect(url.searchParams.get("fee_amount")).toBe(quote.fee_amount);
   });
 
-  test("leaves the fees out after a swap that failed, and returns the tokens", async () => {
-    answerOutcome({ ...swapped, charge_fee: false, error: "Slippage", amount_out: "0", next_steps: [unwrap] });
+  test("returns the tokens after a swap that failed, in another approval", async () => {
+    answerOutcome(failed);
     const wallet = recordingWallet();
     await swapWithNearConnect({ wallet, request, quote, routerUrl: "https://router.test" });
     expect(wallet.batches).toHaveLength(2);
-    expect(wallet.batches[0]).toHaveLength(swapTransactions);
+    expect(wallet.batches[0]).toHaveLength(quote.execution_instructions.length);
     expect(methods(wallet.batches[1]!)).toEqual([["near_withdraw"]]);
+  });
+
+  test("asks for the outcome of the swap's transactions when the wallet leaves out the fee transactions", async () => {
+    const fetch = answerOutcome(failed);
+    const wallet: NearConnectWallet = {
+      // Like a wallet that saw the swap fail
+      signAndSendTransactions: async ({ transactions }) =>
+        transactions.slice(0, swapTransactions).map((_, index) => ({ transaction_outcome: { id: `tx${index}` } })),
+    };
+    await swapWithNearConnect({ wallet, request, quote, routerUrl: "https://router.test" });
+    const url = new URL(fetch.mock.calls[0]![0] as string);
+    expect(url.searchParams.get("tx_hashes")).toBe(
+      Array.from({ length: swapTransactions }, (_, index) => `tx${index}`).join(","),
+    );
   });
 
   test("signs nothing after the swap if the next steps aren't safe", async () => {
@@ -90,7 +112,7 @@ describe("swapping with near-connect", () => {
   });
 
   test("reports the next steps failing apart from the swap", async () => {
-    answerOutcome(swapped);
+    answerOutcome(failed);
     const rejection = new Error("User rejected");
     let batches = 0;
     const wallet: NearConnectWallet = {
@@ -103,7 +125,7 @@ describe("swapping with near-connect", () => {
       },
     };
     expect(await swapWithNearConnect({ wallet, request, quote, routerUrl: "https://router.test" })).toEqual({
-      outcome: swapped,
+      outcome: failed,
       nextStepsError: rejection,
     });
   });

@@ -6,7 +6,7 @@
 
 Client of the Intear DEX Aggregator (router.intear.tech) that checks the router's transactions before anyone signs them, for both ways of paying fees:
 
-- **near-connect** (`swapWithNearConnect`): wallets that ask the trader. The quote's transactions are approved at once, then, after the swap, its fee transactions (only if the swap went through) and the next steps of its outcome, which move tokens where the trader asked for them.
+- **near-connect** (`swapWithNearConnect`): wallets that ask the trader. The quote's transactions, its fee transactions included, are approved at once: the wallet doesn't send the fee transactions of a swap that it sees failed. Then, if there are any, the next steps of its outcome, which move tokens where the trader asked for them, in another approval.
 - **Signers** (`swapWithSigner`): accounts that sign without asking, like bots and custodial wallets. Quotes of a subscription with `feesInNextSteps` leave the fee transactions out and have a `quote_id`. The outcome of their transactions, asked for by that ID, has the fees and the quote improvement fee in its next steps, once the swap went through.
 
 ```ts
