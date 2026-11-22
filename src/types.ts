@@ -76,7 +76,9 @@ export interface Quote {
 
 /** `charge_fee` is whether the swap went through, and `error` why it didn't */
 export type SwapOutcome = {
+  /** What the trader spent of the input, with the fees once the swap went through */
   amount_in: string;
+  /** What the trader got of the output, without the quote improvement fee */
   amount_out: string;
   balance_changes: { token: TokenId; change: string }[];
   next_steps: ExecutionInstruction[];

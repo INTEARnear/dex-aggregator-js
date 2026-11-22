@@ -360,10 +360,11 @@ describe("fees in the next steps", () => {
     ],
     true,
   );
+  /** Of a swap that beat the estimate by 1000: the trader spends 1 NEAR with the fees, and gets the estimate */
   const outcome = (changes: Partial<Omit<SwapOutcome, "charge_fee" | "error">> = {}): SwapOutcome => ({
     charge_fee: true,
-    amount_in: "995000000000000000000000",
-    amount_out: (estimatedOut + 1_000n).toString(),
+    amount_in: "1000000000000000000000000",
+    amount_out: estimatedOut.toString(),
     balance_changes: [],
     next_steps: [...feeTransactions, quoteImprovementFee],
     error: null,
@@ -395,18 +396,47 @@ describe("fees in the next steps", () => {
 
   test("a quote improvement fee of more than the swap beat the quote by", () => {
     const problems = problemsOf(() =>
-      validateNextSteps(NEAR_TO_USDC, quote, outcome({ amount_out: (estimatedOut + 999n).toString() })),
+      validateNextSteps(NEAR_TO_USDC, quote, outcome({ amount_out: (estimatedOut - 1n).toString() })),
     );
     expect(problems).toEqual([
-      "The quote improvement fee of 1000 isn't the 999 that the swap beat the quote by",
+      "With a quote improvement fee of 1000, the trader gets 2846352, not the quote's estimate of 2846353",
+    ]);
+  });
+
+  test("a quote improvement fee of less than the swap beat the quote by", () => {
+    const problems = problemsOf(() =>
+      validateNextSteps(NEAR_TO_USDC, quote, outcome({ amount_out: (estimatedOut + 1n).toString() })),
+    );
+    expect(problems).toEqual([
+      "With a quote improvement fee of 1000, the trader gets 2846354, not the quote's estimate of 2846353",
     ]);
   });
 
   test("a quote improvement fee other than the outcome's", () => {
     const problems = problemsOf(() =>
-      validateNextSteps(NEAR_TO_USDC, quote, outcome({ quote_improvement_fee: "500", amount_out: (estimatedOut + 500n).toString() })),
+      validateNextSteps(NEAR_TO_USDC, quote, outcome({ quote_improvement_fee: "500" })),
     );
     expect(problems).toEqual(["The next steps pay a quote improvement fee of 1000, not the outcome's 500"]);
+  });
+
+  test("the quote improvement fee of exact-out, in the input", () => {
+    const request = REQUESTS["near_to_usdc_exact_out"]!;
+    const exactOut = quoteOf("near_to_usdc_exact_out", "RheaDcl");
+    const nextSteps = [
+      ...exactOut.execution_instructions.filter((instruction) => instruction.NearTransaction.is_fee_transaction === true),
+      transaction(
+        "wrap.near",
+        [call("ft_transfer", { receiver_id: "wallet.intear.near", amount: "1000", memo: "Quote improvement fee" })],
+        true,
+      ),
+    ];
+    // The trader spends the estimate: what the swap took, its fees, and the quote improvement fee
+    const spent = outcome({ amount_in: "702653299353018149569161", amount_out: "2000000", next_steps: nextSteps });
+    expect(problemsOf(() => validateNextSteps(request, withFeesInNextSteps(exactOut), spent))).toEqual([]);
+    const spentMore = { ...spent, amount_in: "702653299353018149569162" };
+    expect(problemsOf(() => validateNextSteps(request, withFeesInNextSteps(exactOut), spentMore))).toEqual([
+      "With a quote improvement fee of 1000, the trader spends 702653299353018149569162, not the quote's estimate of 702653299353018149569161",
+    ]);
   });
 
   test("fees after a swap that failed", () => {

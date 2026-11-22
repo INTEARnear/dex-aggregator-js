@@ -288,13 +288,15 @@ class TransactionChecker {
         `The next steps pay a quote improvement fee of ${this.#quoteImprovementFee}, not the outcome's ${quoteImprovementFee}`,
       );
     }
+    // Takes what beats the estimate, so that the trader gets it of exact-in, and spends it of
+    // exact-out, with the fees
     if (quoteImprovementFee > 0n) {
-      const beatBy = this.#exactIn
-        ? bigint(outcome.amount_out, "amount_out") - this.#estimated
-        : this.#estimated - feeAmount - bigint(outcome.amount_in, "amount_in");
-      if (quoteImprovementFee !== beatBy) {
+      const [amount, getsOrSpends] = this.#exactIn
+        ? [bigint(outcome.amount_out, "amount_out"), "gets"]
+        : [bigint(outcome.amount_in, "amount_in"), "spends"];
+      if (amount !== this.#estimated) {
         this.problem(
-          `The quote improvement fee of ${quoteImprovementFee} isn't the ${beatBy} that the swap beat the quote by`,
+          `With a quote improvement fee of ${quoteImprovementFee}, the trader ${getsOrSpends} ${amount}, not the quote's estimate of ${this.#estimated}`,
         );
       }
     }
