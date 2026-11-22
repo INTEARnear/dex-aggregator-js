@@ -1,6 +1,6 @@
 {
   "name": "@intear/dex-aggregator",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Client of the Intear DEX Aggregator that checks its transactions before they're signed",
   "license": "MIT OR Apache-2.0",
   "type": "module",
