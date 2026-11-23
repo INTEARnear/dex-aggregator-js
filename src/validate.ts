@@ -23,6 +23,19 @@ const QUOTE_IMPROVEMENT_FEE_MEMO = "Quote improvement fee";
 /** As many as the router finds the outcome of */
 const MAX_TRANSACTIONS = 20;
 /**
+ * Intear DEX's operations that take or send the trader's assets. The others, like registering
+ * assets, don't.
+ */
+const ASSET_OPERATIONS = new Set([
+  "OracleRequest",
+  "SwapSimple",
+  "SwapAdvanced",
+  "Withdraw",
+  "DexCall",
+  "TransferAsset",
+  "StorageDeposit",
+]);
+/**
  * The most that the storage deposits of a quote attach in all, and again of its next steps, which
  * have no figure of them. A trader new to Rhea DCL deposits its minimum of 0.5 NEAR.
  */
@@ -60,8 +73,10 @@ export class UnsafeTransactionsError extends Error {
  * the trader allows (the exact input, or the quote's worst case of exact-out), get at least the
  * quote's worst case of the output, call only the tokens of the swap and the DEXes the router
  * uses, attach no more to storage deposits than the quote says and the limits allow, and pay fees
- * only to the requested receivers, no more than requested. A quote that isn't shaped like the
- * router's is unsafe too.
+ * only to the requested receivers, no more than requested. Fields and operations of Intear DEX
+ * and of tokens that do none of this are left to the router, so that it can add them. Rhea and Rhea
+ * DCL are called with exactly the arguments that routes pass, as what others of theirs do isn't
+ * known to the checks.
  */
 export function validateQuote(request: SwapRequest, quote: Quote): void {
   const checker = new TransactionChecker(request, quote, "quote");
@@ -342,7 +357,6 @@ class TransactionChecker {
   #token(contract: string, method: string, args: Json, attached: bigint, isFeeTransaction: boolean): void {
     switch (method) {
       case "storage_deposit": {
-        onlyKeys(args, ["registration_only", "account_id"]);
         if (args["registration_only"] !== true) {
           throw new Error("Deposits more than registration needs");
         }
@@ -353,19 +367,16 @@ class TransactionChecker {
         return;
       }
       case "near_deposit": {
-        onlyKeys(args, []);
         wrapNearOnly(contract);
         this.#wrapped += attached;
         return;
       }
       case "near_withdraw": {
-        onlyKeys(args, ["amount"]);
         wrapNearOnly(contract);
         oneYocto(attached);
         return;
       }
       case "ft_transfer_call": {
-        onlyKeys(args, ["receiver_id", "amount", "msg"]);
         oneYocto(attached);
         const receiverId = string(args["receiver_id"], "receiver_id");
         const amount = bigint(args["amount"], "amount");
@@ -395,7 +406,6 @@ class TransactionChecker {
         return;
       }
       case "ft_transfer": {
-        onlyKeys(args, ["receiver_id", "amount", "memo"]);
         oneYocto(attached);
         const receiverId = string(args["receiver_id"], "receiver_id");
         const amount = bigint(args["amount"], "amount");
@@ -564,22 +574,20 @@ class TransactionChecker {
   #intearDex(method: string, args: Json, attached: bigint): void {
     switch (method) {
       case "storage_deposit": {
-        onlyKeys(args, []);
+        if (args["account_id"] !== undefined) {
+          this.#storageAccount(args["account_id"]);
+        }
         this.#storageDeposits += attached;
         return;
       }
       case "register_assets": {
-        onlyKeys(args, ["asset_ids", "for"]);
         oneYocto(attached);
-        if (args["for"] !== undefined) {
-          const owner = object(args["for"], "for");
-          onlyKeys(owner, ["Account"]);
-          this.#storageAccount(owner["Account"]);
+        if (args["for"] !== undefined && args["for"] !== null) {
+          this.#storageAccount(object(args["for"], "for")["Account"]);
         }
         return;
       }
       case "deposit_near": {
-        onlyKeys(args, ["operations"]);
         if (args["operations"] === undefined) {
           // Into the trader's own balance
           return;
@@ -602,10 +610,9 @@ class TransactionChecker {
         return;
       }
       case "withdraw": {
-        onlyKeys(args, ["asset_id", "amount"]);
         oneYocto(attached);
         this.#ownAsset(args["asset_id"]);
-        onlyKeys(object(args["amount"], "amount"), ["Exact"]);
+        this.#withdrawnToTrader(args["withdraw_to"]);
         return;
       }
       default:
@@ -615,13 +622,11 @@ class TransactionChecker {
 
   /** What the operations take out of the trader's balance on Intear DEX */
   #engineOperations(args: Json): bigint {
-    // A fee discount only lowers the swaps' pool fees, and the engine checks its signature
-    onlyKeys(args, ["operations", "referrer", "referral_fees", "fee_discount"]);
     const referralFee = this.#engineReferralFees(args["referral_fees"]);
-    const operations = array(args["operations"], "operations").map((entry) => {
-      const [kind, value] = singleEntry(object(entry, "operation"));
-      return { kind, operation: object(value, kind) };
-    });
+    const operations = array(args["operations"], "operations")
+      .map((entry) => singleEntry(object(entry, "operation")))
+      .filter(([kind]) => ASSET_OPERATIONS.has(kind))
+      .map(([kind, value]) => ({ kind, operation: object(value, kind) }));
     let taken = 0n;
     let previousSwap: Json | undefined;
     operations.forEach(({ kind, operation }, index) => {
@@ -631,7 +636,6 @@ class TransactionChecker {
         next.operation["amount"] === "OutputOfLastIn";
       switch (kind) {
         case "OracleRequest": {
-          onlyKeys(operation, ["oracle_key", "dex_id", "request", "fee", "swap"]);
           const fee = array(operation["fee"], "The oracle request's fee");
           if (fee.length !== 2) {
             throw new Error("The oracle request has no fee");
@@ -648,7 +652,6 @@ class TransactionChecker {
           }
           // Buys the oracle's fee with at most `constraint` of the input
           const feeSwap = object(operation["swap"], "The oracle fee's swap");
-          onlyKeys(feeSwap, ["dex_id", "message", "asset_in", "constraint"]);
           const assetIn = string(feeSwap["asset_in"], "The oracle fee's swap's asset_in");
           if (!this.#inputAssets.includes(assetIn)) {
             throw new Error("Buys the oracle fee with something else than the input");
@@ -658,26 +661,18 @@ class TransactionChecker {
           taken += mostSwapped;
           break;
         }
-        case "SwapSimple": {
-          onlyKeys(operation, ["dex_id", "message", "asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee"]);
-          taken += this.#engineSwap(operation, previousSwap, feedsNextSwap);
-          break;
-        }
+        case "SwapSimple":
         case "SwapAdvanced": {
-          onlyKeys(operation, ["asset_in", "asset_out", "amount", "constraint", "quote_improvement_fee", "options", "mode"]);
           taken += this.#engineSwap(operation, previousSwap, feedsNextSwap);
           break;
         }
         case "Withdraw": {
-          onlyKeys(operation, ["asset_id", "amount", "to", "rescue_address"]);
           this.#ownAsset(operation["asset_id"]);
-          if (operation["to"] !== null || operation["rescue_address"] !== null) {
-            throw new Error("Withdraws to someone else than the trader");
-          }
+          this.#withdrawnToTrader(operation["to"]);
           break;
         }
         default:
-          throw new Error(`Runs ${kind} on Intear DEX, which routes don't`);
+          throw new Error(`Moves the trader's assets with ${kind}, which routes don't`);
       }
       previousSwap = kind === "SwapSimple" || kind === "SwapAdvanced" ? operation : undefined;
     });
@@ -740,7 +735,6 @@ class TransactionChecker {
       return;
     }
     const fields = object(fee, "quote_improvement_fee");
-    onlyKeys(fields, ["quote_expected_amount", "quote_improvement_receiver"]);
     if (fields["quote_improvement_receiver"] !== this.request.quoteImprovementReceiver) {
       throw new Error("Pays the quote improvement fee to someone else than the requested receiver");
     }
@@ -798,9 +792,18 @@ class TransactionChecker {
       INTEAR_DEX,
       ...this.#feeReceivers,
       ...(this.request.quoteImprovementReceiver === undefined ? [] : [this.request.quoteImprovementReceiver]),
+      // Takes what Intear DEX can't send to the trader
+      ...(this.request.referrerId === undefined ? [] : [this.request.referrerId]),
     ]);
     if (typeof accountId !== "string" || !allowed.has(accountId)) {
       throw new Error(`Registers ${String(accountId)}, which the swap doesn't pay`);
+    }
+  }
+
+  /** Of Intear DEX's withdrawals: the trader's own, or `null` */
+  #withdrawnToTrader(accountId: unknown): void {
+    if (accountId !== undefined && accountId !== null && accountId !== this.request.traderAccountId) {
+      throw new Error("Withdraws to someone else than the trader");
     }
   }
 
@@ -879,7 +882,7 @@ function singleEntry(value: Json): [string, unknown] {
   return entry;
 }
 
-/** Routes call contracts with exactly these arguments, so anything else is someone else's */
+/** Rhea and Rhea DCL are called with exactly these arguments, so anything else is someone else's */
 function onlyKeys(value: Json, keys: string[]): void {
   const unknown = Object.keys(value).filter((key) => !keys.includes(key));
   if (unknown.length > 0) {

@@ -81,6 +81,55 @@ test("a fee discount on Intear DEX", () => {
   expect(problemsOf(() => validateQuote(NEAR_TO_USDC, quote))).toEqual([]);
 });
 
+describe("what the checks leave to the router", () => {
+  const intearDex = quoteOf("near_to_usdc_exact_in", "IntearDex");
+  const expectSafe = (quote: Quote, request = NEAR_TO_USDC) =>
+    expect(problemsOf(() => validateQuote(request, quote))).toEqual([]);
+
+  test("fields of Intear DEX that routes may add", () => {
+    expectSafe(
+      tamper(intearDex, 0, 0, (args) => {
+        (args["operations"] as Record<string, unknown>)["new_field"] = "value";
+        engineOperation(args, "SwapAdvanced")["new_field"] = "value";
+      }),
+    );
+  });
+
+  test("rescue addresses, which only get what Intear DEX can't send to the trader", () => {
+    expectSafe(
+      tamper(intearDex, 0, 0, (args) => {
+        engineOperation(args, "OracleRequest")["rescue_address"] = "wallet.intear.near";
+        engineOperation(args, "Withdraw")["rescue_address"] = "wallet.intear.near";
+      }),
+    );
+  });
+
+  test("withdrawing to the trader by name", () => {
+    expectSafe(
+      tamper(intearDex, 0, 0, (args) => {
+        engineOperation(args, "Withdraw")["to"] = "intear.near";
+      }),
+    );
+  });
+
+  test("operations that move none of the trader's assets", () => {
+    expectSafe(
+      tamper(intearDex, 0, 0, (args) => {
+        const operations = (args["operations"] as Record<string, unknown>)["operations"] as unknown[];
+        operations.unshift({ RegisterAssets: { asset_ids: ["near"], for: null } }, { NewOperation: {} });
+      }),
+    );
+  });
+
+  test("registering the referrer, which takes what Intear DEX can't send to the trader", () => {
+    const quote = structuredClone(intearDex);
+    quote.execution_instructions.unshift(
+      transaction("dex.intear.near", [call("register_assets", { asset_ids: ["near"], for: { Account: "app.near" } })]),
+    );
+    expectSafe(quote, { ...NEAR_TO_USDC, referrerId: "app.near" });
+  });
+});
+
 describe("tampered quotes", () => {
   const rhea = quoteOf("near_to_usdc_exact_in", "Rhea");
   const rheaDcl = quoteOf("near_to_usdc_exact_in", "RheaDcl");
@@ -155,7 +204,7 @@ describe("tampered quotes", () => {
     );
   });
 
-  test("an argument that routes don't pass", () => {
+  test("an argument of Rhea DCL that routes don't pass", () => {
     expectUnsafe(
       tamper(rheaDcl, 0, 1, (args) =>
         tamperJson(args, "msg", (msg) => {
@@ -163,6 +212,17 @@ describe("tampered quotes", () => {
         }),
       ),
       /arguments that routes don't: receiver_id/,
+    );
+  });
+
+  test("an argument of Rhea that routes don't pass", () => {
+    expectUnsafe(
+      tamper(rhea, 0, 1, (args) =>
+        tamperJson(args, "msg", (msg) => {
+          msg["swap_out_recipient"] = "evil.near";
+        }),
+      ),
+      /arguments that routes don't: swap_out_recipient/,
     );
   });
 
@@ -184,7 +244,17 @@ describe("tampered quotes", () => {
     );
   });
 
-  test("an operation that routes don't run", () => {
+  test("withdrawing a balance on Intear DEX to someone else", () => {
+    const quote = structuredClone(intearDex);
+    quote.execution_instructions.push(
+      transaction("dex.intear.near", [
+        call("withdraw", { asset_id: `nep141:${USDC}`, amount: { Exact: "1" }, withdraw_to: "evil.near" }),
+      ]),
+    );
+    expectUnsafe(quote, /dex\.intear\.near withdraw: Withdraws to someone else than the trader/);
+  });
+
+  test("moving the trader's assets with an operation that routes don't run", () => {
     expectUnsafe(
       tamper(intearDex, 0, 0, (args) => {
         const operations = (args["operations"] as Record<string, unknown>)["operations"] as unknown[];
@@ -192,8 +262,16 @@ describe("tampered quotes", () => {
           TransferAsset: { to: { Account: "evil.near" }, asset_id: `nep141:${USDC}`, amount: "1" },
         });
       }),
-      /Runs TransferAsset on Intear DEX/,
+      /Moves the trader's assets with TransferAsset/,
     );
+  });
+
+  test("registering assets for someone the swap doesn't pay", () => {
+    const quote = structuredClone(intearDex);
+    quote.execution_instructions.unshift(
+      transaction("dex.intear.near", [call("register_assets", { asset_ids: ["near"], for: { Account: "evil.near" } })]),
+    );
+    expectUnsafe(quote, /Registers evil\.near/);
   });
 
   test("buying the oracle fee with more than the input", () => {
