@@ -629,6 +629,8 @@ class TransactionChecker {
       .map(([kind, value]) => ({ kind, operation: object(value, kind) }));
     let taken = 0n;
     let previousSwap: Json | undefined;
+    /** Of the quote improvement fees of the split swaps, what beats them all */
+    let quoteImprovementExpected: bigint | undefined;
     operations.forEach(({ kind, operation }, index) => {
       const next = operations[index + 1];
       const feedsNextSwap =
@@ -664,6 +666,10 @@ class TransactionChecker {
         case "SwapSimple":
         case "SwapAdvanced": {
           taken += this.#engineSwap(operation, previousSwap, feedsNextSwap);
+          const expected = this.#engineQuoteImprovementFee(operation["quote_improvement_fee"]);
+          if (expected !== undefined) {
+            quoteImprovementExpected = (quoteImprovementExpected ?? 0n) + expected;
+          }
           break;
         }
         case "Withdraw": {
@@ -676,6 +682,15 @@ class TransactionChecker {
       }
       previousSwap = kind === "SwapSimple" || kind === "SwapAdvanced" ? operation : undefined;
     });
+    const estimated = this.#estimated;
+    if (
+      quoteImprovementExpected !== undefined &&
+      (this.#exactIn ? quoteImprovementExpected < estimated : quoteImprovementExpected > estimated)
+    ) {
+      throw new Error(
+        `Takes a quote improvement fee of what beats ${quoteImprovementExpected}, which the quote's estimate of ${estimated} doesn't`,
+      );
+    }
     // Out of an exact-in swap's input, or on top of an exact-out one's within its constraint
     this.#intearDexFees += (taken * referralFee) / FULL_FEE_FRACTION;
     return taken;
@@ -683,7 +698,8 @@ class TransactionChecker {
 
   /**
    * What the swap takes at most of the input. Exact-in swaps can be chained: each swap of
-   * `OutputOfLastIn` swaps what the one before it gave, and only the last one is constrained.
+   * `OutputOfLastIn` swaps what the one before it gave, and only the last one is constrained. They
+   * can also be split, each swapping its own part of the input.
    */
   #engineSwap(operation: Json, previousSwap: Json | undefined, feedsNextSwap: boolean): bigint {
     let taken = 0n;
@@ -720,7 +736,6 @@ class TransactionChecker {
       throw new Error("Swaps to something else than the output");
     }
     const constraint = bigint(operation["constraint"], "constraint");
-    this.#engineQuoteImprovementFee(operation["quote_improvement_fee"]);
     if (this.request.amount.exactOut !== undefined) {
       // Gives exactly the requested output, taking at most the constraint
       this.#guaranteedOutput += this.request.amount.exactOut;
@@ -730,20 +745,16 @@ class TransactionChecker {
     return taken;
   }
 
-  #engineQuoteImprovementFee(fee: unknown): void {
+  /** What the swap gives or takes before its quote improvement fee takes the rest, if it has one */
+  #engineQuoteImprovementFee(fee: unknown): bigint | undefined {
     if (fee === null || fee === undefined) {
-      return;
+      return undefined;
     }
     const fields = object(fee, "quote_improvement_fee");
     if (fields["quote_improvement_receiver"] !== this.request.quoteImprovementReceiver) {
       throw new Error("Pays the quote improvement fee to someone else than the requested receiver");
     }
-    const expected = bigint(fields["quote_expected_amount"], "quote_expected_amount");
-    if (this.#exactIn ? expected < this.#estimated : expected > this.#estimated) {
-      throw new Error(
-        `Takes a quote improvement fee of what beats ${expected}, which the quote's estimate of ${this.#estimated} doesn't`,
-      );
-    }
+    return bigint(fields["quote_expected_amount"], "quote_expected_amount");
   }
 
   /** In millionths of the input */

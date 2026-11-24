@@ -774,6 +774,59 @@ describe("chains of swaps on Intear DEX", () => {
   });
 });
 
+describe("split swaps on Intear DEX", () => {
+  type Operation = Record<string, unknown>;
+
+  /** The quote's swap split into two of its own parts of the input, the way the router splits it */
+  function split(change: (first: Operation, second: Operation) => void = () => {}): Quote {
+    return tamper(quoteOf("near_to_usdc_exact_in", "IntearDex"), 0, 0, (args) => {
+      const operations = (args["operations"] as Operation)["operations"] as Operation[];
+      const index = operations.findIndex((operation) => "SwapSimple" in operation || "SwapAdvanced" in operation);
+      const swap = Object.values(operations[index]!)[0] as Operation;
+      const amount = BigInt((swap["amount"] as { Amount: { ExactIn: string } }).Amount.ExactIn);
+      const constraint = BigInt(swap["constraint"] as string);
+      const fee = swap["quote_improvement_fee"] as Operation;
+      const expected = BigInt(fee["quote_expected_amount"] as string);
+      const part = (share: (whole: bigint) => bigint): Operation => ({
+        dex_id: "slimedragon.near/xyk",
+        message: "",
+        asset_in: swap["asset_in"],
+        asset_out: swap["asset_out"],
+        amount: { Amount: { ExactIn: share(amount).toString() } },
+        constraint: share(constraint).toString(),
+        quote_improvement_fee: { ...fee, quote_expected_amount: share(expected).toString() },
+      });
+      const first = part((whole) => (whole * 7n) / 10n);
+      const second = part((whole) => whole - (whole * 7n) / 10n);
+      operations.splice(index, 1, { SwapSimple: first }, { SwapSimple: second });
+      change(first, second);
+    });
+  }
+
+  test("a split swap", () => {
+    expect(problemsOf(() => validateQuote(NEAR_TO_USDC, split()))).toEqual([]);
+  });
+
+  test("quote improvement fees of what the estimate already has, between them", () => {
+    expectUnsafe(
+      split((_, second) => {
+        const fee = second["quote_improvement_fee"] as Operation;
+        fee["quote_expected_amount"] = (BigInt(fee["quote_expected_amount"] as string) - 1n).toString();
+      }),
+      /Takes a quote improvement fee of what beats/,
+    );
+  });
+
+  test("guaranteeing less than the worst case between them", () => {
+    expectUnsafe(
+      split((_, second) => {
+        second["constraint"] = (BigInt(second["constraint"] as string) - 1n).toString();
+      }),
+      /The swaps guarantee/,
+    );
+  });
+});
+
 describe("limits of the next steps", () => {
   const quote = quoteOf("near_to_usdc_exact_in", "RheaDcl");
   const outcome = (nextSteps: SwapOutcome["next_steps"]): SwapOutcome => ({
