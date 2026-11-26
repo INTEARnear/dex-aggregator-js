@@ -69,6 +69,8 @@ export interface Quote {
   storage_deposits: string;
   /** What the fee transactions pay out of the wallet balance of the input token */
   fee_amount: string;
+  /** What the route's pools, and the oracle its swap asks, take of its input as fees: `"0.003"` is 0.3%. The referral fees aren't in it. */
+  pool_fee: string;
   signing?: { nonce: number; block_hash: string };
   /** Of a quote whose fees are paid in the next steps of its outcome */
   quote_id?: number;
